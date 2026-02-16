@@ -252,27 +252,28 @@ def spec_mlx_device_key() -> str:
 
 # Shared k-bounds macro, prepended to each kernel source.
 # Computes the range of overlapping frames [k_min, k_max] for output sample `st`.
-# HOP, FRAME, NFRAME are compile-time template constants.
+# HOP, FRAME are compile-time template constants.
+# n_frames and out_len are runtime values loaded from a `params` int32 buffer.
 _METAL_K_BOUNDS = """
 int k_max = st / HOP;
-if (k_max >= NFRAME) k_max = NFRAME - 1;
+if (k_max >= n_frames) k_max = n_frames - 1;
 int k_min = 0;
 { int target = st - FRAME; if (target >= 0) k_min = (target / HOP) + 1; }
 """
 
 # --- 1) Metal Kernel: Gather-style OLA ---
 # Type-polymorphic template; float32 accumulation, cast to T on output.
-# OUTL is bucketed (rounded up) for JIT-cache stability; grid.x = actual out_len
-# so threads beyond the real length never launch (except threadgroup rounding,
-# handled by init_value=0 on the output buffer).
+# Dynamic lengths (n_frames, out_len) are passed via `params` buffer to avoid
+# kernel recompilation for every unique audio length.
 _METAL_OLA_TEMPLATE = """
+int n_frames = params[0];
+int out_len = params[1];
 int st = (int)thread_position_in_grid.x;
 int sb = (int)thread_position_in_grid.y;
-if (st >= OUTL) return;
-int NFRAME = frames_shape[1];
+if (st >= out_len) return;
 """ + _METAL_K_BOUNDS + """
 float acc = 0.0f;
-int base_offset = sb * NFRAME * FRAME;
+int base_offset = sb * n_frames * FRAME;
 
 #pragma unroll 4
 for (int k = k_max; k >= k_min; --k) {
@@ -280,20 +281,21 @@ for (int k = k_max; k >= k_min; --k) {
     acc += (float)frames[base_offset + k * FRAME + off] * (float)window[off];
 }
 
-out[sb * OUTL + st] = (T)acc;
+out[sb * out_len + st] = (T)acc;
 """
 
 # --- 2) Metal Kernel: Gather-style OLA + normalization ---
 # Fused overlap-add with Torch-style masked divide by window² envelope.
 _METAL_OLA_NORM_TEMPLATE = """
+int n_frames = params[0];
+int out_len = params[1];
 int st = (int)thread_position_in_grid.x;
 int sb = (int)thread_position_in_grid.y;
-if (st >= OUTL) return;
-int NFRAME = frames_shape[1];
+if (st >= out_len) return;
 """ + _METAL_K_BOUNDS + """
 float acc = 0.0f;
 float den = 0.0f;
-int base_offset = sb * NFRAME * FRAME;
+int base_offset = sb * n_frames * FRAME;
 
 #pragma unroll 4
 for (int k = k_max; k >= k_min; --k) {
@@ -304,15 +306,17 @@ for (int k = k_max; k >= k_min; --k) {
 
 // Torch-style masked normalization (no epsilon clamp):
 // keep zero where overlap-add envelope is effectively zero.
-out[sb * OUTL + st] = (den > 1.0e-11f) ? (T)(acc / den) : (T)(0.0f);
+out[sb * out_len + st] = (den > 1.0e-11f) ? (T)(acc / den) : (T)(0.0f);
 """
 
 
 # --- 3) Metal Kernel: OLA Envelope ---
 # Computes window² overlap-add envelope (1-D, no batch dimension).
 _METAL_OLA_ENVELOPE_TEMPLATE = """
+int n_frames = params[0];
+int out_len = params[1];
 int st = (int)thread_position_in_grid.x;
-if (st >= OUTL) return;
+if (st >= out_len) return;
 """ + _METAL_K_BOUNDS + """
 float den = 0.0f;
 
@@ -325,20 +329,173 @@ for (int k = k_min; k <= k_max; ++k) {
 out[st] = (T)den;
 """
 
-def _bucket_outl(out_len: int) -> int:
-    """Round out_len up to next multiple of 256 to reduce kernel specializations.
+# --- 4) Metal Kernel: Fused windowed frame extraction ---
+# Combines reflect-pad + as_strided + window multiply into a single pass.
+# Reads directly from the unpadded signal with reflect-boundary indexing,
+# multiplies by the analysis window, and writes windowed frames.
+# Eliminates the padded-signal intermediate allocation entirely.
+#
+# Two variants:
+#   Simple — Grid: (n_fft, n_frames, B).  One thread per (fft_bin, frame, batch).
+#            Each thread reads one sample from global memory independently.
+#   Tiled  — One threadgroup per tile of consecutive frames.  Loads the shared
+#            signal chunk into threadgroup memory once, then each thread reads
+#            from fast shared memory.  ~NFFT/HOP data reuse ratio (typically 4×).
+#            Faster when the workload is bandwidth-bound (large B × sig_len).
 
-    Each unique set of template constants compiles a separate Metal kernel.
-    HOP and FRAME are fixed per transform config, but OUTL varies with
-    input length.  Bucketing OUTL keeps the JIT cache small while the actual
-    thread grid (set to real out_len) prevents extra work.  Threads launched
-    by threadgroup rounding that land in [out_len, bucketed) write into the
-    padded output region and are discarded by the caller's slice.
-    """
-    out_len = int(out_len)
-    if out_len <= 0:
-        return 256
-    return ((out_len + 255) // 256) * 256
+_METAL_FUSED_FRAME_EXTRACT_TEMPLATE = """
+int sig_len = params[0];
+int n_frames = params[1];
+int f_idx = (int)thread_position_in_grid.x;
+int n_idx = (int)thread_position_in_grid.y;
+int b_idx = (int)thread_position_in_grid.z;
+if (f_idx >= NFFT || n_idx >= n_frames) return;
+
+// Position in the (virtual) padded signal
+int src_pos = n_idx * HOP + f_idx;
+
+// Reflect-pad boundary: map to original signal index
+int orig_idx;
+if (src_pos < PAD) {
+    orig_idx = PAD - src_pos;
+} else if (src_pos < PAD + sig_len) {
+    orig_idx = src_pos - PAD;
+} else {
+    orig_idx = sig_len - 2 - (src_pos - PAD - sig_len);
+}
+
+float val = (float)signal[b_idx * sig_len + orig_idx] * (float)win[f_idx];
+out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)val;
+"""
+
+_METAL_TILED_FRAME_EXTRACT_TEMPLATE = """
+// Threadgroup shared memory for the signal chunk covering this tile of frames.
+// CHUNK_LEN = (TILE_FRAMES - 1) * HOP + NFFT, sized at compile time.
+threadgroup float shared_buf[CHUNK_LEN];
+
+int sig_len = params[0];
+int n_frames = params[1];
+
+int local_x = (int)thread_position_in_threadgroup.x;
+int local_y = (int)thread_position_in_threadgroup.y;
+int tg_x_idx = (int)threadgroup_position_in_grid.x;
+int b_idx = (int)threadgroup_position_in_grid.z;
+
+// Frame range for this tile
+int frame_start = tg_x_idx * TILE_FRAMES;
+int frame_end = frame_start + TILE_FRAMES;
+if (frame_end > n_frames) frame_end = n_frames;
+int n_tile_frames = frame_end - frame_start;
+
+// Virtual-padded range this tile needs
+int sig_start = frame_start * HOP;
+int sig_end_val = (frame_end - 1) * HOP + NFFT;
+int chunk_len = sig_end_val - sig_start;
+
+// Cooperative load: all threads load signal into shared memory
+int n_threads = TG_X * TG_Y;
+int my_id = local_y * TG_X + local_x;
+for (int i = my_id; i < chunk_len; i += n_threads) {
+    int src_pos = sig_start + i;
+    int orig_idx;
+    if (src_pos < PAD) {
+        orig_idx = PAD - src_pos;
+    } else if (src_pos < PAD + sig_len) {
+        orig_idx = src_pos - PAD;
+    } else {
+        orig_idx = sig_len - 2 - (src_pos - PAD - sig_len);
+    }
+    shared_buf[i] = (float)signal[b_idx * sig_len + orig_idx];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// Each thread handles one frame in the tile, looping over fft bins
+int tile_frame = local_y;
+if (tile_frame < n_tile_frames) {
+    int n_idx = frame_start + tile_frame;
+    for (int f = local_x; f < NFFT; f += TG_X) {
+        int local_pos = tile_frame * HOP + f;
+        float val = shared_buf[local_pos] * (float)win[f];
+        out[b_idx * n_frames * NFFT + n_idx * NFFT + f] = (T)val;
+    }
+}
+"""
+
+# Minimum output bytes (B * n_frames * n_fft * 4) before using the tiled kernel.
+# Below this threshold the workload is latency-bound and tiling adds no benefit.
+# Benchmarked on M4 Max: tiled wins consistently above ~100 MB, is neutral at
+# ~60 MB, and can regress below that.  100 MB is a safe crossover point.
+_TILED_FRAME_EXTRACT_BYTE_THRESHOLD = 100_000_000  # ~100 MB
+
+
+class _FrameExtractCache:
+    """Singleton for the fused frame-extraction Metal kernels (simple + tiled)."""
+    _lock = threading.Lock()
+    _simple: object = None
+    _tiled: object = None
+
+    @classmethod
+    def get_simple(cls):
+        if cls._simple is not None:
+            return cls._simple
+        with cls._lock:
+            if cls._simple is not None:
+                return cls._simple
+            try:
+                cls._simple = mx.fast.metal_kernel(
+                    name="fused_frame_extract",
+                    input_names=["signal", "win", "params"],
+                    output_names=["out"],
+                    source=_METAL_FUSED_FRAME_EXTRACT_TEMPLATE,
+                )
+            except Exception:
+                cls._simple = False
+            return cls._simple
+
+    @classmethod
+    def get_tiled(cls):
+        if cls._tiled is not None:
+            return cls._tiled
+        with cls._lock:
+            if cls._tiled is not None:
+                return cls._tiled
+            try:
+                cls._tiled = mx.fast.metal_kernel(
+                    name="tiled_frame_extract",
+                    input_names=["signal", "win", "params"],
+                    output_names=["out"],
+                    source=_METAL_TILED_FRAME_EXTRACT_TEMPLATE,
+                )
+            except Exception:
+                cls._tiled = False
+            return cls._tiled
+
+    @classmethod
+    def get(cls):
+        """Backward-compat: return the simple kernel."""
+        return cls.get_simple()
+
+    @classmethod
+    def tile_params(cls, n_fft: int, hop_length: int) -> Optional[tuple]:
+        """Compute tiling parameters that fit in 32 KB threadgroup memory.
+
+        Returns (tile_frames, tg_x, tg_y, chunk_len) or None if tiling
+        is not possible for this config.
+        """
+        max_shared_floats = 32768 // 4  # 8192 floats in 32 KB
+        tile_frames = (max_shared_floats - n_fft) // hop_length + 1
+        if tile_frames < 2:
+            return None  # no reuse benefit with 1 frame per tile
+        tg_x = min(256, n_fft)
+        tg_y = tile_frames
+        # Metal: max 1024 threads per threadgroup
+        if tg_x * tg_y > 1024:
+            tg_y = 1024 // tg_x
+            tile_frames = tg_y
+        if tile_frames < 2:
+            return None
+        chunk_len = (tile_frames - 1) * hop_length + n_fft
+        return (tile_frames, tg_x, tg_y, chunk_len)
 
 
 # Template-tuple tracking for params_cache.* debug events.
@@ -632,28 +789,19 @@ class _KernelCache:
 
     @classmethod
     def get_ola(cls, dtype=None):
-        """Return the OLA Metal kernel (compile once, dtype-agnostic).
-
-        The *dtype* parameter is accepted for backward compatibility with
-        monkeypatch hooks that pass ``(cls, dtype)`` but is no longer used —
-        dtype dispatch happens at call time via the ``template`` parameter.
-        """
+        """Return the OLA Metal kernel (compile once, dtype-agnostic)."""
         if cls._ola_kernel is not None:
             _record_cache_event("kernel_cache.ola.hit")
             return cls._ola_kernel
         _record_cache_event("kernel_cache.ola.miss")
-
         with cls._lock:
             if cls._ola_kernel is not None:
-                _record_cache_event("kernel_cache.ola.hit")
                 return cls._ola_kernel
-
             try:
                 cls._ola_kernel = mx.fast.metal_kernel(
                     name="ola_windowed_optimized",
-                    input_names=["frames", "window"],
+                    input_names=["frames", "window", "params"],
                     output_names=["out"],
-
                     source=_METAL_OLA_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.ola.compile_ok")
@@ -664,26 +812,19 @@ class _KernelCache:
 
     @classmethod
     def get_ola_norm(cls, dtype=None):
-        """Return the OLA+norm Metal kernel (compile once, dtype-agnostic).
-
-        *dtype* accepted for backward compatibility; see ``get_ola`` docstring.
-        """
+        """Return the OLA+norm Metal kernel (compile once, dtype-agnostic)."""
         if cls._ola_norm_kernel is not None:
             _record_cache_event("kernel_cache.ola_norm.hit")
             return cls._ola_norm_kernel
         _record_cache_event("kernel_cache.ola_norm.miss")
-
         with cls._lock:
             if cls._ola_norm_kernel is not None:
-                _record_cache_event("kernel_cache.ola_norm.hit")
                 return cls._ola_norm_kernel
-
             try:
                 cls._ola_norm_kernel = mx.fast.metal_kernel(
                     name="ola_norm_windowed_div_envelope",
-                    input_names=["frames", "window", "window_sq"],
+                    input_names=["frames", "window", "window_sq", "params"],
                     output_names=["out"],
-
                     source=_METAL_OLA_NORM_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.ola_norm.compile_ok")
@@ -694,26 +835,19 @@ class _KernelCache:
 
     @classmethod
     def get_envelope(cls, dtype=None):
-        """Return the envelope Metal kernel (compile once, dtype-agnostic).
-
-        *dtype* accepted for backward compatibility; see ``get_ola`` docstring.
-        """
+        """Return the envelope Metal kernel (compile once, dtype-agnostic)."""
         if cls._envelope_kernel is not None:
             _record_cache_event("kernel_cache.envelope.hit")
             return cls._envelope_kernel
         _record_cache_event("kernel_cache.envelope.miss")
-
         with cls._lock:
             if cls._envelope_kernel is not None:
-                _record_cache_event("kernel_cache.envelope.hit")
                 return cls._envelope_kernel
-
             try:
                 cls._envelope_kernel = mx.fast.metal_kernel(
-                    name="ola_envelope_optimized",
-                    input_names=["window_sq"],
+                    name="ola_envelope",
+                    input_names=["window_sq", "params"],
                     output_names=["out"],
-
                     source=_METAL_OLA_ENVELOPE_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.envelope.compile_ok")
@@ -724,17 +858,14 @@ class _KernelCache:
 
     @classmethod
     def debug_snapshot(cls) -> dict:
+        def _is_compiled(v):
+            return v is not None and v is not False
+
         with cls._lock:
             return {
-                "ola_kernel_compiled": cls._ola_kernel is not None and cls._ola_kernel is not False,
-                "ola_norm_kernel_compiled": (
-                    cls._ola_norm_kernel is not None
-                    and cls._ola_norm_kernel is not False
-                ),
-                "envelope_kernel_compiled": (
-                    cls._envelope_kernel is not None
-                    and cls._envelope_kernel is not False
-                ),
+                "ola_kernel_compiled": _is_compiled(cls._ola_kernel),
+                "ola_norm_kernel_compiled": _is_compiled(cls._ola_norm_kernel),
+                "envelope_kernel_compiled": _is_compiled(cls._envelope_kernel),
                 "tgx_entries": int(len(cls._tgx_cache)),
                 "tgx_loaded": bool(cls._tgx_cache_loaded),
                 "tgx_dirty": bool(cls._tgx_cache_dirty),
@@ -782,6 +913,7 @@ def _run_metal_ola(
     if frames.dtype != window.dtype:
         window = window.astype(frames.dtype)
 
+    B, nframe, frame = frames.shape
     kernel = _KernelCache.get_ola()
     if kernel is False:
         _record_cache_event("backend.ola.fallback", detail="metal_unavailable")
@@ -790,12 +922,11 @@ def _run_metal_ola(
                 "backend_policy='metal' requires Metal OLA kernel, but it is unavailable."
             )
         return _run_fallback(frames, window, int(out_len))
-    B, nframe, frame = frames.shape
     frames = mx.contiguous(frames)
     window = mx.contiguous(window)
 
-    bucketed = _bucket_outl(out_len)
-    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("OUTL", bucketed)]
+    params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
+    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame)]
     _record_tmpl_event("ola", tmpl)
 
     tgx = _KernelCache.autotune_threadgroup_x(
@@ -804,24 +935,24 @@ def _run_metal_ola(
         n_fft=frame,
         hop=hop,
         grid=(out_len, B, 1),
-        inputs=[frames, window],
+        inputs=[frames, window, params],
         template=tmpl,
-        output_shape=(B, bucketed),
+        output_shape=(B, out_len),
         output_dtype=frames.dtype,
         default_tgx=256,
     )
 
     outputs = kernel(
-        inputs=[frames, window],
+        inputs=[frames, window, params],
         template=tmpl,
-        output_shapes=[(B, bucketed)],
+        output_shapes=[(B, out_len)],
         output_dtypes=[frames.dtype],
         grid=(out_len, B, 1),
         threadgroup=(tgx, 1, 1),
         init_value=0,
     )
     _record_cache_event("backend.ola.metal")
-    return outputs[0][:, :out_len] if bucketed != out_len else outputs[0]
+    return outputs[0]
 
 def _run_metal_ola_norm(
     frames: mx.array,
@@ -885,8 +1016,8 @@ def _run_metal_ola_norm(
     if frames.dtype != window_sq.dtype:
         window_sq = window_sq.astype(frames.dtype)
 
-    kernel = _KernelCache.get_ola_norm()
     B, nframe, frame = frames.shape
+    kernel = _KernelCache.get_ola_norm()
     if kernel is False:
         _record_cache_event("backend.ola_norm.fallback", detail="metal_unavailable")
         if require_metal:
@@ -900,8 +1031,8 @@ def _run_metal_ola_norm(
     window = mx.contiguous(window)
     window_sq = mx.contiguous(window_sq)
 
-    bucketed = _bucket_outl(out_len)
-    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("OUTL", bucketed)]
+    params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
+    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame)]
     _record_tmpl_event("ola_norm", tmpl)
 
     tgx = _KernelCache.autotune_threadgroup_x(
@@ -910,24 +1041,24 @@ def _run_metal_ola_norm(
         n_fft=frame,
         hop=hop,
         grid=(out_len, B, 1),
-        inputs=[frames, window, window_sq],
+        inputs=[frames, window, window_sq, params],
         template=tmpl,
-        output_shape=(B, bucketed),
+        output_shape=(B, out_len),
         output_dtype=frames.dtype,
         default_tgx=256,
     )
 
     outputs = kernel(
-        inputs=[frames, window, window_sq],
+        inputs=[frames, window, window_sq, params],
         template=tmpl,
-        output_shapes=[(B, bucketed)],
+        output_shapes=[(B, out_len)],
         output_dtypes=[frames.dtype],
         grid=(out_len, B, 1),
         threadgroup=(tgx, 1, 1),
         init_value=0,
     )
     _record_cache_event("backend.ola_norm.metal")
-    return outputs[0][:, :out_len] if bucketed != out_len else outputs[0]
+    return outputs[0]
 # ==============================================================================
 # Helpers & Transforms
 # ==============================================================================
@@ -1121,24 +1252,18 @@ def _ola_envelope_min_check_cached(
 
 @mx.compile
 def _torch_like_reflect_pad_1d_compiled(x: mx.array, pad: int) -> mx.array:
-    """Compiled padding logic."""
+    """Compiled reflect-pad using pure MLX ops."""
     if pad <= 0:
         return x
-    
     if x.shape[-1] <= pad:
         raise ValueError(
             f"torch-like reflect padding requires input_length > pad "
             f"(got length={x.shape[-1]}, pad={pad})"
         )
-
-    # Reflect padding: (..., 1:pad+1) reversed
-    left = x[..., 1 : pad + 1]
-    left = left[..., ::-1]
-    
-    right = x[..., -pad - 1 : -1]
-    right = right[..., ::-1]
-    
+    left = x[..., 1 : pad + 1][..., ::-1]
+    right = x[..., -pad - 1 : -1][..., ::-1]
     return mx.concatenate([left, x, right], axis=-1)
+
 
 def _torch_like_reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
     return _torch_like_reflect_pad_1d_compiled(x, pad)
@@ -1301,6 +1426,7 @@ class SpectralTransform:
         '_window_sq', 'center', 'normalized', 'periodic',
         'istft_backend_policy',
         '_window_cache_sig',
+        '_norm_factor', '_inv_norm_factor',
         '_cache_key', 'ola_denom', 'ola_denom_inv',
         '_compiled_stft_fns', '_compiled_istft_fns',
         '_torch_window_cache', '_window_runtime_cache',
@@ -1351,6 +1477,10 @@ class SpectralTransform:
             n_fft=self.n_fft,
             periodic=self.periodic,
         )
+
+        # Pre-computed normalization factors (avoid per-call sqrt)
+        self._inv_norm_factor = 1.0 / math.sqrt(self.n_fft) if self.normalized else 1.0
+        self._norm_factor = math.sqrt(self.n_fft) if self.normalized else 1.0
 
         # Pre-computed squared window for fused NOLA
         self._window_sq = mx.contiguous((self.window ** 2).astype(mx.float32))
@@ -1554,6 +1684,69 @@ class SpectralTransform:
         )
         return fn(z)
 
+    def compiled_pair(
+        self,
+        *,
+        length: int,
+        layout: str = "bnf",
+        warmup_batch: Optional[int] = None,
+    ) -> tuple:
+        """Return ``(stft_fn, istft_fn)`` compiled for a fixed configuration.
+
+        10–20% faster than the eager ``stft()``/``istft()`` methods in
+        steady-state loops by eliminating per-call Python dispatch overhead.
+
+        Args:
+            length: Signal length in samples.  Fixed for this pair.
+            layout: ``"bnf"`` (default, fastest) or ``"bfn"``.
+            warmup_batch: If provided, run one warmup pass with this batch
+                size so that kernel compilation and safety checks are paid
+                upfront rather than on the first real call.
+
+        Returns:
+            ``(stft_fn, istft_fn)`` — call as ``z = stft_fn(x)``,
+            ``y = istft_fn(z)``.
+
+        Example::
+
+            t = SpectralTransform(n_fft=1024, hop_length=256)
+            stft, istft = t.compiled_pair(length=44100, warmup_batch=2)
+
+            for chunk in stream:
+                z = stft(chunk)
+                z = process(z)
+                y = istft(z)
+                mx.eval(y)
+        """
+        resolved_layout = _resolve_stft_output_layout(layout)
+
+        # Prime the NOLA safety cache with one eager call so the compiled
+        # path never hits an mx.eval barrier inside the safety check.
+        warmup_len = int(length)
+        warmup_b = int(warmup_batch) if warmup_batch is not None else 1
+        x_warm = mx.zeros((warmup_b, warmup_len), dtype=mx.float32)
+        z_warm = self.stft(x_warm, output_layout=resolved_layout)
+        y_warm = self.istft(
+            z_warm, length=warmup_len,
+            input_layout=resolved_layout, safety="auto",
+        )
+        mx.eval(z_warm, y_warm)
+
+        stft_fn = self.get_compiled_stft(output_layout=resolved_layout)
+        istft_fn = self.get_compiled_istft(
+            length=warmup_len,
+            input_layout=resolved_layout,
+            safety="auto",
+        )
+
+        # If warmup_batch was given, also prewarm the compiled graphs.
+        if warmup_batch is not None:
+            z_c = stft_fn(x_warm)
+            y_c = istft_fn(z_c)
+            mx.eval(z_c, y_c)
+
+        return stft_fn, istft_fn
+
     def _get_ola_envelope(
         self, n_frames: int, *, require_metal: bool = False,
     ) -> tuple[mx.array, mx.array]:
@@ -1605,11 +1798,10 @@ class SpectralTransform:
             self._cache_key = key
             return denom, denom_inv
             
-        bucketed = _bucket_outl(out_len)
+        params = mx.array([int(n_frames), int(out_len)], dtype=mx.int32)
         tmpl = [
             ("T", window_sq.dtype), ("HOP", self.hop_length),
-            ("FRAME", self.n_fft), ("NFRAME", n_frames),
-            ("OUTL", bucketed),
+            ("FRAME", self.n_fft),
         ]
         _record_tmpl_event("envelope", tmpl)
 
@@ -1619,25 +1811,25 @@ class SpectralTransform:
             n_fft=self.n_fft,
             hop=self.hop_length,
             grid=(out_len, 1, 1),
-            inputs=[window_sq],
+            inputs=[window_sq, params],
             template=tmpl,
-            output_shape=(bucketed,),
+            output_shape=(out_len,),
             output_dtype=window_sq.dtype,
             default_tgx=256,
         )
 
         outputs = kernel(
-            inputs=[window_sq],
+            inputs=[window_sq, params],
             template=tmpl,
             grid=(out_len, 1, 1),
             threadgroup=(tgx, 1, 1),
-            output_shapes=[(bucketed,)],
+            output_shapes=[(out_len,)],
             output_dtypes=[window_sq.dtype],
             init_value=0,
         )
         _record_cache_event("backend.envelope.metal")
 
-        denom = outputs[0][:out_len] if bucketed != out_len else outputs[0]
+        denom = outputs[0]
         if denom.dtype != mx.float32:
             denom = denom.astype(mx.float32)
         # Match fused kernel semantics: masked divide when envelope is tiny.
@@ -1660,6 +1852,82 @@ class SpectralTransform:
         elif x.ndim != 2:
             raise ValueError(f"stft expects 1D or 2D input, got {x.shape}")
 
+        B, sig_len = x.shape
+
+        # ── Fast path: fused frame extraction ────────────────────────
+        # When center=True and the signal is long enough, a Metal kernel
+        # combines reflect-pad + strided windowing, eliminating the
+        # padded-signal intermediate buffer.
+        #
+        # Two kernel variants:
+        #   Tiled  — uses threadgroup shared memory for ~NFFT/HOP data reuse.
+        #            ~1.3× faster when bandwidth-bound (large B × sig_len).
+        #   Simple — one thread per output element, no shared memory.
+        #            Used for small workloads where dispatch latency dominates.
+        if self.center and sig_len >= self.n_fft:
+            pad = self.n_fft // 2
+            padded_len = sig_len + 2 * pad
+            n_frames = (padded_len - self.n_fft) // self.hop_length + 1
+            out_bytes = B * n_frames * self.n_fft * 4
+
+            # params buffer: dynamic lengths as runtime inputs (not template constants)
+            # to avoid kernel recompilation for every unique audio length.
+            fe_params = mx.array([int(sig_len), int(n_frames)], dtype=mx.int32)
+
+            # Try tiled kernel for large workloads
+            tiled_ok = False
+            if out_bytes >= _TILED_FRAME_EXTRACT_BYTE_THRESHOLD:
+                tiled_kernel = _FrameExtractCache.get_tiled()
+                tp = _FrameExtractCache.tile_params(self.n_fft, self.hop_length)
+                if tiled_kernel and tp is not None:
+                    tile_frames, tg_x, tg_y, chunk_len = tp
+                    x = mx.contiguous(x)
+                    n_tile_groups = math.ceil(n_frames / tile_frames)
+                    tmpl = [
+                        ("T", x.dtype), ("NFFT", self.n_fft),
+                        ("HOP", self.hop_length), ("PAD", pad),
+                        ("TILE_FRAMES", tile_frames), ("TG_X", tg_x),
+                        ("TG_Y", tg_y), ("CHUNK_LEN", chunk_len),
+                    ]
+                    outputs = tiled_kernel(
+                        inputs=[x, self.window, fe_params],
+                        template=tmpl,
+                        output_shapes=[(B, n_frames, self.n_fft)],
+                        output_dtypes=[x.dtype],
+                        grid=(n_tile_groups * tg_x, tg_y, B),
+                        threadgroup=(tg_x, tg_y, 1),
+                    )
+                    tiled_ok = True
+
+            # Fall back to simple kernel
+            if not tiled_ok:
+                kernel = _FrameExtractCache.get_simple()
+                if kernel and kernel is not False:
+                    x = mx.contiguous(x)
+                    tmpl = [
+                        ("T", x.dtype), ("NFFT", self.n_fft),
+                        ("HOP", self.hop_length), ("PAD", pad),
+                    ]
+                    outputs = kernel(
+                        inputs=[x, self.window, fe_params],
+                        template=tmpl,
+                        output_shapes=[(B, n_frames, self.n_fft)],
+                        output_dtypes=[x.dtype],
+                        grid=(self.n_fft, n_frames, B),
+                        threadgroup=(min(256, self.n_fft), 1, 1),
+                    )
+                else:
+                    outputs = None
+
+            if outputs is not None:
+                spec = mx.fft.rfft(outputs[0], axis=-1)
+                if self.normalized:
+                    spec = spec * self._inv_norm_factor
+                if resolved_layout == "bnf":
+                    return spec
+                return spec.transpose(0, 2, 1)
+
+        # ── Fallback path ────────────────────────────────────────────
         # Ensure contiguous memory before striding
         x = mx.contiguous(x)
 
@@ -1681,15 +1949,15 @@ class SpectralTransform:
             shape=(B, n_frames, self.n_fft),
             strides=(T_pad, self.hop_length, 1),
         )
-        
+
         # Apply window
         frames = frames * self.window
-        
+
         # FFT (Real -> Complex)
         spec = mx.fft.rfft(frames, axis=-1)
 
         if self.normalized:
-            spec = spec * (1.0 / math.sqrt(self.n_fft))
+            spec = spec * self._inv_norm_factor
 
         # MLX rFFT emits [B, N, F]. Keep native layout for bnf, transpose for bfn.
         if resolved_layout == "bnf":
@@ -1849,7 +2117,7 @@ class SpectralTransform:
             time_frames = mx.fft.irfft(z_bnf, n=self.n_fft, axis=-1)
         
         if self.normalized:
-            time_frames = time_frames * math.sqrt(self.n_fft)
+            time_frames = time_frames * self._norm_factor
         window_runtime, window_sq_runtime = self._window_pair_for_dtype(time_frames.dtype)
 
         out_len = self.hop_length * (n_frames - 1) + self.n_fft

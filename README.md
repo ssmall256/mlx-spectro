@@ -63,6 +63,7 @@ SpectralTransform(
 **Methods:**
 - `stft(x, output_layout="bfn")` — Forward STFT. Input: `[T]` or `[B, T]`.
 - `istft(z, length=None, ...)` — Inverse STFT. Returns `[B, T]`.
+- `compiled_pair(length, layout="bnf", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
 
 ### `get_transform_mlx(**kwargs)`
@@ -76,6 +77,43 @@ Create or validate a 1D analysis window.
 ### `resolve_fft_params(n_fft, hop_length, win_length, pad)`
 
 Resolve effective FFT parameters with PyTorch-compatible defaults.
+
+## Benchmarks
+
+Benchmarked across 288 STFT/iSTFT configurations (varying `n_fft`, `hop_length`, frame counts, and length modes), 3 replicates each, with 10 warmup iterations and 100 timed iterations per case.
+
+### iSTFT Performance
+
+| Machine | vs torch.istft (MPS) | vs mlx-stft | Mean latency |
+|---|---|---|---|
+| M4 Max (Mac16,5) | **3.4x faster** | **2.2x faster** | 0.31 ms |
+| M1 Pro (MacBookPro18,4) | **4.3x faster** | **2.8x faster** | 0.58 ms |
+
+### STFT Performance
+
+| Machine | vs torch.stft (MPS) | vs mlx-stft | Mean latency |
+|---|---|---|---|
+| M4 Max (Mac16,5) | **1.7x faster** | **2.5x faster** | 0.24 ms |
+| M1 Pro (MacBookPro18,4) | **2.0x faster** | **2.5x faster** | 0.42 ms |
+
+### Compiled Mode (10–20% faster)
+
+For tight inference loops with fixed input shapes, use `compiled_pair` to
+eliminate per-call Python dispatch overhead:
+
+```python
+t = SpectralTransform(n_fft=1024, hop_length=256, window_fn="hann")
+stft, istft = t.compiled_pair(length=44100, warmup_batch=2)
+
+for chunk in audio_stream:
+    z = stft(chunk)
+    z = process(z)
+    y = istft(z)
+    mx.eval(y)
+```
+
+Use the eager `t.stft()` / `t.istft()` methods when input shapes vary or
+during exploration.
 
 ## Environment Variables
 

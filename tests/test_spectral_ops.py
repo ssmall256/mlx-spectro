@@ -274,3 +274,202 @@ class TestEdgeCases:
         np.testing.assert_allclose(
             np.array(y), np.array(x), atol=1e-4, rtol=1e-4
         )
+
+    def test_reflect_pad_correctness(self):
+        """Verify compiled reflect-pad matches numpy reflect padding."""
+        from mlx_spectro.spectral_ops import _torch_like_reflect_pad_1d_compiled
+
+        for B in [1, 4]:
+            for T in [100, 512, 2048]:
+                for pad in [64, 256]:
+                    if T <= pad:
+                        continue
+                    x = mx.random.normal((B, T))
+                    mx.eval(x)
+
+                    # Metal kernel path
+                    y_metal = _torch_like_reflect_pad_1d_compiled(x, pad)
+                    mx.eval(y_metal)
+
+                    # Reference: numpy reflect pad
+                    x_np = np.array(x)
+                    y_ref = np.pad(x_np, [(0, 0), (pad, pad)], mode="reflect")
+
+                    np.testing.assert_allclose(
+                        np.array(y_metal), y_ref, atol=1e-6,
+                        err_msg=f"reflect pad mismatch for B={B}, T={T}, pad={pad}",
+                    )
+
+    def test_large_nfft(self):
+        """Large n_fft (4096) roundtrip should work correctly."""
+        t = SpectralTransform(n_fft=4096, hop_length=1024, window_fn="hann")
+        length = 16000
+        x = mx.random.normal((1, length))
+        z = t.stft(x, output_layout="bnf")
+        y = t.istft(z, length=length, input_layout="bnf")
+        mx.eval(y)
+        np.testing.assert_allclose(
+            np.array(y), np.array(x), atol=1e-4, rtol=1e-4
+        )
+
+    def test_compiled_pair_roundtrip(self):
+        """compiled_pair returns stft/istft that match eager roundtrip."""
+        length = 16000
+        t = SpectralTransform(n_fft=1024, hop_length=256, window_fn="hann")
+        stft_fn, istft_fn = t.compiled_pair(length=length, warmup_batch=2)
+
+        x = mx.random.normal((2, length))
+        mx.eval(x)
+
+        # Compiled roundtrip
+        z_c = stft_fn(x)
+        y_c = istft_fn(z_c)
+        mx.eval(y_c)
+
+        # Eager roundtrip
+        z_e = t.stft(x, output_layout="bnf")
+        y_e = t.istft(z_e, length=length, input_layout="bnf")
+        mx.eval(y_e)
+
+        np.testing.assert_allclose(
+            np.array(y_c), np.array(y_e), atol=1e-6,
+            err_msg="compiled_pair output diverges from eager",
+        )
+        np.testing.assert_allclose(
+            np.array(y_c), np.array(x), atol=1e-4, rtol=1e-4,
+            err_msg="compiled_pair roundtrip not accurate",
+        )
+
+    def test_compiled_pair_bfn_layout(self):
+        """compiled_pair works with bfn layout."""
+        length = 8000
+        t = SpectralTransform(n_fft=512, hop_length=128, window_fn="hann")
+        stft_fn, istft_fn = t.compiled_pair(length=length, layout="bfn")
+
+        x = mx.random.normal((1, length))
+        mx.eval(x)
+        z = stft_fn(x)
+        y = istft_fn(z)
+        mx.eval(y)
+
+        np.testing.assert_allclose(
+            np.array(y), np.array(x), atol=1e-4, rtol=1e-4,
+        )
+
+    def test_fused_frame_extract_matches_fallback(self):
+        """Fused Metal frame extraction produces bit-exact output vs fallback."""
+        from mlx_spectro.spectral_ops import (
+            _FrameExtractCache,
+            _torch_like_reflect_pad_1d_compiled,
+        )
+        kernel = _FrameExtractCache.get()
+        if kernel is False:
+            self.skipTest("Metal frame extraction kernel unavailable")
+
+        for B in [1, 4]:
+            for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
+                sig_len = n_fft * 10
+                t = SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann")
+                x = mx.random.normal((B, sig_len))
+                mx.eval(x)
+                x_c = mx.contiguous(x)
+
+                # Fused path: Metal kernel
+                pad = n_fft // 2
+                padded_len = sig_len + 2 * pad
+                n_frames = (padded_len - n_fft) // hop + 1
+                params = mx.array([sig_len, n_frames], dtype=mx.int32)
+                tmpl = [
+                    ("T", x.dtype), ("NFFT", n_fft), ("HOP", hop),
+                    ("PAD", pad),
+                ]
+                fused = kernel(
+                    inputs=[x_c, t.window, params],
+                    template=tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_fft, n_frames, B),
+                    threadgroup=(min(256, n_fft), 1, 1),
+                )
+                fused_out = fused[0]
+
+                # Fallback path: pad + stride + multiply
+                x_padded = _torch_like_reflect_pad_1d_compiled(x_c, pad)
+                T_pad = x_padded.shape[1]
+                frames = mx.as_strided(
+                    x_padded, shape=(B, n_frames, n_fft),
+                    strides=(T_pad, hop, 1),
+                )
+                fallback_out = frames * t.window
+
+                mx.eval(fused_out, fallback_out)
+                np.testing.assert_array_equal(
+                    np.array(fused_out), np.array(fallback_out),
+                    err_msg=f"fused frame extract mismatch: B={B}, n_fft={n_fft}, hop={hop}",
+                )
+
+    def test_tiled_frame_extract_matches_simple(self):
+        """Tiled (shared-memory) frame extraction is bit-exact vs simple kernel."""
+        from mlx_spectro.spectral_ops import _FrameExtractCache
+
+        simple = _FrameExtractCache.get_simple()
+        tiled = _FrameExtractCache.get_tiled()
+        if simple is False:
+            self.skipTest("Simple frame extraction kernel unavailable")
+        if tiled is False:
+            self.skipTest("Tiled frame extraction kernel unavailable")
+
+        for B in [1, 4]:
+            for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
+                tp = _FrameExtractCache.tile_params(n_fft, hop)
+                if tp is None:
+                    continue
+                tile_frames, tg_x, tg_y, chunk_len = tp
+
+                sig_len = n_fft * 10
+                x = mx.random.normal((B, sig_len))
+                mx.eval(x)
+                x_c = mx.contiguous(x)
+
+                pad = n_fft // 2
+                padded_len = sig_len + 2 * pad
+                n_frames = (padded_len - n_fft) // hop + 1
+
+                # params buffer for both kernels
+                params = mx.array([sig_len, n_frames], dtype=mx.int32)
+
+                # Simple kernel
+                s_tmpl = [
+                    ("T", x.dtype), ("NFFT", n_fft), ("HOP", hop),
+                    ("PAD", pad),
+                ]
+                simple_out = simple(
+                    inputs=[x_c, SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann").window, params],
+                    template=s_tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_fft, n_frames, B),
+                    threadgroup=(min(256, n_fft), 1, 1),
+                )[0]
+
+                # Tiled kernel
+                n_tile_groups = math.ceil(n_frames / tile_frames)
+                t_tmpl = s_tmpl + [
+                    ("TILE_FRAMES", tile_frames), ("TG_X", tg_x),
+                    ("TG_Y", tg_y), ("CHUNK_LEN", chunk_len),
+                ]
+                win = SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann").window
+                tiled_out = tiled(
+                    inputs=[x_c, win, params],
+                    template=t_tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_tile_groups * tg_x, tg_y, B),
+                    threadgroup=(tg_x, tg_y, 1),
+                )[0]
+
+                mx.eval(simple_out, tiled_out)
+                np.testing.assert_array_equal(
+                    np.array(simple_out), np.array(tiled_out),
+                    err_msg=f"tiled vs simple mismatch: B={B}, n_fft={n_fft}, hop={hop}",
+                )
