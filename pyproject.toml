@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-spectro"
+version = "0.1.0"
+description = "High-performance STFT/iSTFT for Apple MLX with fused Metal kernels"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Sam" }]
+keywords = ["mlx", "stft", "istft", "spectral", "audio", "dsp", "apple-silicon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mlx>=0.5.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+dev = ["pytest>=7.0", "build"]
+
+[project.urls]
+Homepage = "https://github.com/ssmall256/mlx-spectro"
+Repository = "https://github.com/ssmall256/mlx-spectro"
+Issues = "https://github.com/ssmall256/mlx-spectro/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_spectro"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
