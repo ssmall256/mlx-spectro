@@ -80,26 +80,50 @@ Resolve effective FFT parameters with PyTorch-compatible defaults.
 
 ## Benchmarks
 
-Benchmarked across 288 STFT/iSTFT configurations (varying `n_fft`, `hop_length`, frame counts, and length modes), 3 replicates each, with 10 warmup iterations and 100 timed iterations per case.
+Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
 
-### iSTFT Performance
+### STFT Forward
 
-| Machine | vs torch.istft (MPS) | vs mlx-stft | Mean latency |
+| Config | mlx-spectro | torch MPS | mlx-stft | vs torch | vs mlx-stft |
+|---|---|---|---|---|---|
+| B=1 T=16k nfft=512 | 0.16 ms | 0.21 ms | 0.31 ms | 1.4x | 1.9x |
+| B=4 T=160k nfft=1024 | 0.37 ms | 0.78 ms | 1.09 ms | **2.1x** | **3.0x** |
+| B=8 T=160k nfft=1024 | 0.28 ms | 0.68 ms | 1.53 ms | **2.5x** | **5.6x** |
+| B=4 T=1.3M nfft=1024 | 0.79 ms | 1.71 ms | 5.03 ms | **2.2x** | **6.3x** |
+| B=8 T=480k nfft=1024 | 0.58 ms | 1.30 ms | 3.73 ms | **2.2x** | **6.4x** |
+
+### iSTFT Forward
+
+| Config | mlx-spectro | torch MPS | mlx-stft | vs torch | vs mlx-stft |
+|---|---|---|---|---|---|
+| B=1 T=16k nfft=512 | 0.17 ms | 0.49 ms | 0.25 ms | 3.0x | 1.5x |
+| B=4 T=160k nfft=1024 | 0.21 ms | 0.99 ms | 0.98 ms | **4.8x** | **4.7x** |
+| B=8 T=160k nfft=1024 | 0.29 ms | 1.58 ms | 1.62 ms | **5.4x** | **5.6x** |
+| B=4 T=1.3M nfft=1024 | 0.77 ms | 5.74 ms | 6.68 ms | **7.5x** | **8.7x** |
+| B=8 T=480k nfft=1024 | 0.60 ms | 4.10 ms | 4.55 ms | **6.8x** | **7.6x** |
+
+### Differentiable STFT + iSTFT (Forward + Backward)
+
+| Config | mlx-spectro | torch MPS | vs torch |
 |---|---|---|---|
-| M4 Max (Mac16,5) | **3.4x faster** | **2.2x faster** | 0.31 ms |
-| M1 Pro (MacBookPro18,4) | **4.3x faster** | **2.8x faster** | 0.58 ms |
+| B=1 T=16k nfft=512 | 0.32 ms | 0.97 ms | **3.0x** |
+| B=4 T=160k nfft=1024 | 0.61 ms | 2.28 ms | **3.7x** |
+| B=8 T=160k nfft=1024 | 1.05 ms | 4.33 ms | **4.1x** |
+| B=4 T=1.3M nfft=1024 | 4.30 ms | 17.44 ms | **4.1x** |
+| B=8 T=480k nfft=1024 | 3.01 ms | 12.53 ms | **4.2x** |
 
-### STFT Performance
+### Roundtrip Accuracy (STFT → iSTFT max abs error)
 
-| Machine | vs torch.stft (MPS) | vs mlx-stft | Mean latency |
-|---|---|---|---|
-| M4 Max (Mac16,5) | **1.7x faster** | **2.5x faster** | 0.24 ms |
-| M1 Pro (MacBookPro18,4) | **2.0x faster** | **2.5x faster** | 0.42 ms |
+| Config | mlx-spectro | torch MPS |
+|---|---|---|
+| B=1 T=16k nfft=512 | 1.67e-06 | 2.38e-06 |
+| B=4 T=160k nfft=2048 | 2.86e-06 | 5.25e-06 |
+| B=8 T=480k nfft=1024 | 3.81e-06 | 4.77e-06 |
 
-### Compiled Mode (10–20% faster)
+### Compiled Mode
 
-For tight inference loops with fixed input shapes, use `compiled_pair` to
-eliminate per-call Python dispatch overhead:
+For tight inference loops with fixed input shapes, `compiled_pair` eliminates
+per-call Python dispatch overhead (10–20% faster for small workloads):
 
 ```python
 t = SpectralTransform(n_fft=1024, hop_length=256, window_fn="hann")
@@ -112,8 +136,7 @@ for chunk in audio_stream:
     mx.eval(y)
 ```
 
-Use the eager `t.stft()` / `t.istft()` methods when input shapes vary or
-during exploration.
+Use the eager `t.stft()` / `t.istft()` methods when input shapes vary.
 
 ## Environment Variables
 
