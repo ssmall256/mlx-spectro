@@ -1416,6 +1416,7 @@ _MLX_OLA_FUSE_NORM = (
     not in ("0", "false", "no", "off")
 )
 
+
 class SpectralTransform:
     """
     High-performance STFT/iSTFT engine for MLX.
@@ -1746,6 +1747,156 @@ class SpectralTransform:
             mx.eval(z_c, y_c)
 
         return stft_fn, istft_fn
+
+    # ------------------------------------------------------------------
+    # Differentiable STFT / iSTFT
+    # ------------------------------------------------------------------
+
+    def differentiable_stft(self, x: mx.array) -> mx.array:
+        """STFT with gradient support.
+
+        Returns spectrogram in **bnf** layout ``[B, N, F]``.
+
+        Use this entry point instead of :meth:`stft` when you need
+        ``mx.grad`` / ``mx.value_and_grad`` to flow through the transform.
+
+        Uses pure MLX ops (reflect-pad → ``as_strided`` → window → ``rfft``)
+        which are all natively differentiable, bypassing the opaque Metal
+        frame-extraction kernels.
+        """
+        if x.ndim == 1:
+            x = x[None, :]
+        elif x.ndim != 2:
+            raise ValueError(f"differentiable_stft expects 1D or 2D input, got {x.shape}")
+
+        # --- Step 1: reflect-pad (differentiable) ---
+        if self.center:
+            pad = self.n_fft // 2
+            x = _torch_like_reflect_pad_1d_compiled(x, pad)
+
+        B, T_pad = x.shape
+        if T_pad < self.n_fft:
+            x = mx.pad(x, [(0, 0), (0, self.n_fft - T_pad)])
+            T_pad = int(x.shape[1])
+
+        n_frames = (T_pad - self.n_fft) // self.hop_length + 1
+
+        # --- Step 2: strided frame extraction (differentiable via as_strided) ---
+        frames = mx.as_strided(
+            x,
+            shape=(B, n_frames, self.n_fft),
+            strides=(T_pad, self.hop_length, 1),
+        )
+
+        # --- Step 3: window (element-wise, differentiable) ---
+        frames = frames * self.window[None, None, :]
+
+        # --- Step 4: rfft (natively differentiable) ---
+        spec = mx.fft.rfft(frames, axis=-1)
+
+        # --- Step 5: normalization (differentiable) ---
+        if self.normalized:
+            spec = spec * self._inv_norm_factor
+
+        return spec  # [B, N, F] (bnf layout)
+
+    def differentiable_istft(
+        self,
+        z: mx.array,
+        *,
+        length: Optional[int] = None,
+    ) -> mx.array:
+        """iSTFT with gradient support.
+
+        Expects spectrogram in **bnf** layout ``[B, N, F]``.
+        Returns time-domain signal ``[B, T]``.
+
+        Use this entry point instead of :meth:`istft` when you need
+        ``mx.grad`` / ``mx.value_and_grad`` to flow through the transform.
+
+        Uses pure MLX ops (``irfft`` → window → scatter-add OLA → envelope
+        division → trim) which are all natively differentiable, bypassing the
+        opaque Metal OLA kernels.
+        """
+        if z.ndim == 2:
+            z = z[None, ...]
+        elif z.ndim != 3:
+            raise ValueError(
+                f"differentiable_istft expects 2D or 3D input, got {z.shape}"
+            )
+
+        n_fft = self.n_fft
+        hop_length = self.hop_length
+
+        B, n_frames, freq_bins = z.shape
+        n_frames_int = int(n_frames)
+        out_len = hop_length * (n_frames_int - 1) + n_fft
+
+        # --- Step 1: irfft (differentiable) ---
+        time_frames = mx.fft.irfft(z, n=n_fft, axis=-1)  # [B, N, n_fft]
+
+        # --- Step 2: normalization (differentiable) ---
+        if self.normalized:
+            time_frames = time_frames * self._norm_factor
+
+        # --- Step 3: window multiply (differentiable) ---
+        window = self.window
+        windowed = time_frames * window.astype(time_frames.dtype)[None, None, :]
+
+        # --- Step 4: overlap-add via scatter (differentiable via at[].add) ---
+        frame_starts = mx.arange(n_frames_int, dtype=mx.int32) * hop_length
+        offsets = mx.arange(n_fft, dtype=mx.int32)
+        indices = frame_starts[:, None] + offsets[None, :]  # [N, n_fft]
+        flat_indices = indices.reshape(-1)
+        flat_indices_safe = mx.clip(flat_indices, 0, out_len - 1)
+        valid_mask = (flat_indices < out_len).astype(windowed.dtype)
+
+        # Batched scatter-add
+        flat_vals = windowed.reshape(B, -1) * valid_mask[None, :]  # [B, N*n_fft]
+        batch_offsets = (mx.arange(B, dtype=mx.int32) * out_len)[:, None]
+        batch_indices = (batch_offsets + flat_indices_safe[None, :]).reshape(-1)
+
+        out_flat = mx.zeros((B * out_len,), dtype=windowed.dtype)
+        out_flat = out_flat.at[batch_indices].add(flat_vals.reshape(-1))
+        out = out_flat.reshape(B, out_len)
+
+        # --- Step 5: envelope normalization (differentiable) ---
+        window_sq = self._window_sq
+        wsq_tiled = mx.tile(window_sq.astype(mx.float32), (n_frames_int,)) * valid_mask.astype(mx.float32)
+        envelope = mx.zeros((out_len,), dtype=mx.float32)
+        envelope = envelope.at[flat_indices_safe].add(wsq_tiled)
+
+        # Masked divide (avoid division by zero)
+        envelope_safe = mx.where(mx.abs(envelope) > 1e-11, envelope, mx.ones_like(envelope))
+        env_mask = (mx.abs(envelope) > 1e-11).astype(out.dtype)
+        out = (out / envelope_safe[None, :]) * env_mask[None, :]
+
+        # --- Step 6: trim / pad (differentiable slicing) ---
+        if self.center:
+            pad = n_fft // 2
+            if length is not None:
+                target = int(length)
+                start = pad
+                end = min(out_len, start + target)
+                out = out[:, start:end]
+                if int(out.shape[1]) < target:
+                    out = mx.concatenate(
+                        [out, mx.zeros((B, target - int(out.shape[1])), dtype=out.dtype)],
+                        axis=1,
+                    )
+            else:
+                out = out[:, pad:-pad] if out_len > 2 * pad else out[:, :0]
+        elif length is not None:
+            target = int(length)
+            if out_len >= target:
+                out = out[:, :target]
+            else:
+                out = mx.concatenate(
+                    [out, mx.zeros((B, target - out_len), dtype=out.dtype)],
+                    axis=1,
+                )
+
+        return out
 
     def _get_ola_envelope(
         self, n_frames: int, *, require_metal: bool = False,

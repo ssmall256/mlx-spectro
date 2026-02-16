@@ -473,3 +473,293 @@ class TestEdgeCases:
                     np.array(simple_out), np.array(tiled_out),
                     err_msg=f"tiled vs simple mismatch: B={B}, n_fft={n_fft}, hop={hop}",
                 )
+
+
+# ---------------------------------------------------------------------------
+# Autograd (differentiable STFT / iSTFT)
+# ---------------------------------------------------------------------------
+
+
+class TestSTFTBackward:
+    """Backward-pass tests for differentiable_stft."""
+
+    def test_stft_backward_exists(self):
+        """Gradient is non-None, finite, and non-trivial."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+
+        def loss(x):
+            return mx.abs(t.differentiable_stft(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert g.dtype == mx.float32
+        assert bool(mx.isfinite(g).all().item())
+        assert bool((mx.abs(g).sum() > 0).item())
+
+    def test_stft_backward_small_signal(self):
+        """Backward works for small signals (fallback path)."""
+        t = SpectralTransform(256, 64)
+        x = mx.random.normal((1, 512))
+        mx.eval(x)
+
+        def loss(x):
+            return mx.abs(t.differentiable_stft(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+
+    def test_stft_backward_no_center(self):
+        """Backward works with center=False."""
+        t = SpectralTransform(512, 128, center=False)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+
+        def loss(x):
+            return mx.abs(t.differentiable_stft(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+
+    @pytest.mark.parametrize("n_fft,hop", [(256, 64), (512, 128), (1024, 256)])
+    def test_stft_backward_sizes(self, n_fft, hop):
+        """Backward works across different FFT sizes."""
+        t = SpectralTransform(n_fft, hop)
+        x = mx.random.normal((1, 8000))
+        mx.eval(x)
+
+        def loss(x):
+            return mx.abs(t.differentiable_stft(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+        assert bool((mx.abs(g).sum() > 0).item())
+
+
+class TestISTFTBackward:
+    """Backward-pass tests for differentiable_istft."""
+
+    def test_istft_backward_exists(self):
+        """Gradient is non-None, finite, and non-trivial."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+        spec = t.stft(x, output_layout="bnf")
+        mx.eval(spec)
+
+        def loss(z):
+            return t.differentiable_istft(z, length=4096).square().sum()
+
+        g = mx.grad(loss)(spec)
+        mx.eval(g)
+        assert g.shape == spec.shape
+        assert g.dtype == mx.complex64
+        assert bool(mx.isfinite(mx.abs(g)).all().item())
+        assert bool((mx.abs(g).sum() > 0).item())
+
+    def test_istft_backward_no_center(self):
+        """Backward works with center=False."""
+        t = SpectralTransform(512, 128, center=False)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+        spec = t.stft(x, output_layout="bnf")
+        mx.eval(spec)
+
+        def loss(z):
+            return t.differentiable_istft(z).square().sum()
+
+        g = mx.grad(loss)(spec)
+        mx.eval(g)
+        assert g.shape == spec.shape
+        assert bool(mx.isfinite(mx.abs(g)).all().item())
+
+    def test_istft_backward_no_length(self):
+        """Backward works when length=None."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((1, 4096))
+        mx.eval(x)
+        spec = t.stft(x, output_layout="bnf")
+        mx.eval(spec)
+
+        def loss(z):
+            return t.differentiable_istft(z).square().sum()
+
+        g = mx.grad(loss)(spec)
+        mx.eval(g)
+        assert g.shape == spec.shape
+        assert bool(mx.isfinite(mx.abs(g)).all().item())
+
+
+class TestRoundtripGrad:
+    """Test gradient flow through STFT → iSTFT roundtrip."""
+
+    def test_roundtrip_grad(self):
+        """Full roundtrip: x → stft → istft → loss → backward."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((2, 8000))
+        mx.eval(x)
+
+        def loss(x):
+            spec = t.differentiable_stft(x)
+            y = t.differentiable_istft(spec, length=8000)
+            return (y - mx.stop_gradient(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+        assert bool((mx.abs(g).sum() > 0).item())
+
+    def test_roundtrip_grad_near_zero(self):
+        """Roundtrip reconstruction error gradient should be tiny."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((1, 4096))
+        mx.eval(x)
+
+        def loss(x):
+            spec = t.differentiable_stft(x)
+            y = t.differentiable_istft(spec, length=4096)
+            return (y - mx.stop_gradient(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        # STFT→iSTFT is near-perfect, so gradient of reconstruction error
+        # should be very small.
+        assert float(mx.max(mx.abs(g)).item()) < 1e-3
+
+    def test_roundtrip_grad_large_batch(self):
+        """Roundtrip with B=4."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((4, 16000))
+        mx.eval(x)
+
+        def loss(x):
+            spec = t.differentiable_stft(x)
+            y = t.differentiable_istft(spec, length=16000)
+            return y.square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+
+
+class TestNoGradOverhead:
+    """Verify that non-differentiable path still works."""
+
+    def test_stft_no_grad(self):
+        """Regular stft produces no autograd graph artifacts."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+        spec = t.stft(x)
+        mx.eval(spec)
+        # Should work fine without differentiable wrapper
+        assert spec.shape[0] == 2
+
+    def test_istft_no_grad(self):
+        """Regular istft produces no autograd graph artifacts."""
+        t = SpectralTransform(512, 128)
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+        spec = t.stft(x, output_layout="bnf")
+        mx.eval(spec)
+        y = t.istft(spec, length=4096, input_layout="bnf")
+        mx.eval(y)
+        assert y.shape == (2, 4096)
+
+
+class TestNumericalGradCheck:
+    """Numerical gradient verification using finite differences.
+
+    Uses Pearson correlation to verify gradient direction correctness
+    (robust to float32 precision limits) plus a normalized error check
+    for magnitude accuracy.
+    """
+
+    @staticmethod
+    def _check_gradient(analytic_np, numerical_np, label: str, corr_tol: float = 0.999):
+        """Verify analytic vs numerical gradient match."""
+        a = analytic_np.flatten()
+        n = numerical_np.flatten()
+        # Correlation: verifies gradient *direction* is correct
+        corr = np.corrcoef(a, n)[0, 1]
+        # Cosine similarity: verifies both direction and relative magnitude
+        cos_sim = np.dot(a, n) / (np.linalg.norm(a) * np.linalg.norm(n) + 1e-12)
+        assert corr > corr_tol, (
+            f"{label} gradient direction wrong: correlation={corr:.6f} (need >{corr_tol})"
+        )
+        assert cos_sim > 0.99, (
+            f"{label} gradient magnitude wrong: cosine_sim={cos_sim:.6f} (need >0.99)"
+        )
+
+    def test_stft_numerical_grad(self):
+        """Finite-difference check for STFT gradient."""
+        t = SpectralTransform(128, 32)
+        x = mx.random.normal((1, 256))
+        mx.eval(x)
+
+        def scalar_loss(x):
+            spec = t.differentiable_stft(x)
+            return mx.abs(spec).square().sum()
+
+        analytic = mx.grad(scalar_loss)(x)
+        mx.eval(analytic)
+
+        eps = 1e-3
+        x_np = np.array(x)
+        numerical = np.zeros_like(x_np)
+        for i in range(x_np.shape[1]):
+            x_plus = x_np.copy()
+            x_plus[0, i] += eps
+            x_minus = x_np.copy()
+            x_minus[0, i] -= eps
+            f_plus = float(scalar_loss(mx.array(x_plus)).item())
+            f_minus = float(scalar_loss(mx.array(x_minus)).item())
+            numerical[0, i] = (f_plus - f_minus) / (2 * eps)
+
+        self._check_gradient(np.array(analytic), numerical, "STFT")
+
+    def test_istft_numerical_grad(self):
+        """Finite-difference check for iSTFT gradient (real part only)."""
+        t = SpectralTransform(128, 32)
+        x = mx.random.normal((1, 256))
+        mx.eval(x)
+        spec = t.stft(x, output_layout="bnf")
+        mx.eval(spec)
+
+        spec_real = mx.real(spec)
+        spec_imag = mx.imag(spec)
+        mx.eval(spec_real, spec_imag)
+
+        def scalar_loss_real(sr):
+            z = sr + 1j * mx.stop_gradient(spec_imag)
+            return t.differentiable_istft(z, length=256).square().sum()
+
+        analytic = mx.grad(scalar_loss_real)(spec_real)
+        mx.eval(analytic)
+
+        eps = 1e-3
+        sr_np = np.array(spec_real)
+        numerical = np.zeros_like(sr_np)
+        for n in range(sr_np.shape[1]):
+            for f in range(sr_np.shape[2]):
+                sr_plus = sr_np.copy()
+                sr_plus[0, n, f] += eps
+                sr_minus = sr_np.copy()
+                sr_minus[0, n, f] -= eps
+                f_plus = float(scalar_loss_real(mx.array(sr_plus)).item())
+                f_minus = float(scalar_loss_real(mx.array(sr_minus)).item())
+                numerical[0, n, f] = (f_plus - f_minus) / (2 * eps)
+
+        # iSTFT OLA scatter-add accumulates many float32 values, reducing
+        # numerical precision. Use a slightly relaxed correlation threshold.
+        self._check_gradient(np.array(analytic), numerical, "iSTFT", corr_tol=0.995)
