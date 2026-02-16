@@ -449,6 +449,7 @@ float acc = 0.0f;
     int k_min = 0;
     { int target = padded_pos - NFFT; if (target >= 0) k_min = (target / HOP) + 1; }
 
+    #pragma unroll 4
     for (int k = k_min; k <= k_max; ++k) {
         int f = padded_pos - k * HOP;
         acc += (float)grad_frames[base_offset + k * NFFT + f] * (float)win[f];
@@ -464,6 +465,7 @@ if (t_idx > 0 && t_idx <= PAD) {
     int k_min = 0;
     { int target = padded_pos - NFFT; if (target >= 0) k_min = (target / HOP) + 1; }
 
+    #pragma unroll 4
     for (int k = k_min; k <= k_max; ++k) {
         int f = padded_pos - k * HOP;
         acc += (float)grad_frames[base_offset + k * NFFT + f] * (float)win[f];
@@ -482,6 +484,7 @@ if (t_idx >= sig_len - PAD - 1 && t_idx < sig_len - 1) {
         int k_min = 0;
         { int target = padded_pos - NFFT; if (target >= 0) k_min = (target / HOP) + 1; }
 
+        #pragma unroll 4
         for (int k = k_min; k <= k_max; ++k) {
             int f = padded_pos - k * HOP;
             acc += (float)grad_frames[base_offset + k * NFFT + f] * (float)win[f];
@@ -511,10 +514,7 @@ int t = n_idx * HOP + f_idx;
 float grad_val = 0.0f;
 
 if (t < out_len) {
-    float env_val = (float)envelope[t];
-    if (env_val > 1.0e-11f) {
-        grad_val = (float)grad_output[b_idx * out_len + t] * (float)win[f_idx] / env_val;
-    }
+    grad_val = (float)grad_output[b_idx * out_len + t] * (float)win[f_idx] * (float)inv_envelope[t];
 }
 
 out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)grad_val;
@@ -632,7 +632,7 @@ class _BackwardKernelCache:
             try:
                 cls._istft_bwd = mx.fast.metal_kernel(
                     name="istft_backward",
-                    input_names=["grad_output", "win", "envelope", "params"],
+                    input_names=["grad_output", "win", "inv_envelope", "params"],
                     output_names=["out"],
                     source=_METAL_ISTFT_BACKWARD_TEMPLATE,
                 )
@@ -2039,13 +2039,25 @@ class SpectralTransform:
                     ("T", cotangent_c.dtype), ("NFFT", n_fft),
                     ("HOP", hop_length), ("PAD", pad),
                 ]
+                grid_bwd = (sl_i, B_i, 1)
+                tgx = _KernelCache.autotune_threadgroup_x(
+                    kernel=bwd_kernel,
+                    kernel_name=f"stft_backward_{cotangent_c.dtype}",
+                    n_fft=n_fft, hop=hop_length,
+                    grid=grid_bwd,
+                    inputs=[cotangent_c, window, bwd_params],
+                    template=tmpl,
+                    output_shape=(B_i, sl_i),
+                    output_dtype=cotangent_c.dtype,
+                    default_tgx=256,
+                )
                 grad_out = bwd_kernel(
                     inputs=[cotangent_c, window, bwd_params],
                     template=tmpl,
                     output_shapes=[(B_i, sl_i)],
                     output_dtypes=[cotangent_c.dtype],
-                    grid=(sl_i, B_i, 1),
-                    threadgroup=(min(256, sl_i), 1, 1),
+                    grid=grid_bwd,
+                    threadgroup=(tgx, 1, 1),
                 )
                 return grad_out[0]
 
@@ -2143,11 +2155,23 @@ class SpectralTransform:
             if envelope_kernel and envelope_kernel is not False:
                 env_params = mx.array([n_frames_int, out_len], dtype=mx.int32)
                 env_tmpl = [("T", mx.float32), ("HOP", hop_length), ("FRAME", n_fft)]
+                env_grid = (out_len, 1, 1)
+                env_tgx = _KernelCache.autotune_threadgroup_x(
+                    kernel=envelope_kernel,
+                    kernel_name=f"ola_envelope_{mx.float32}",
+                    n_fft=n_fft, hop=hop_length,
+                    grid=env_grid,
+                    inputs=[window_sq.astype(mx.float32), env_params],
+                    template=env_tmpl,
+                    output_shape=(out_len,),
+                    output_dtype=mx.float32,
+                    default_tgx=256,
+                )
                 env_outputs = envelope_kernel(
                     inputs=[window_sq.astype(mx.float32), env_params],
                     template=env_tmpl,
-                    grid=(out_len, 1, 1),
-                    threadgroup=(min(256, out_len), 1, 1),
+                    grid=env_grid,
+                    threadgroup=(env_tgx, 1, 1),
                     output_shapes=[(out_len,)],
                     output_dtypes=[mx.float32],
                     init_value=0,
@@ -2165,6 +2189,9 @@ class SpectralTransform:
                 envelope = mx.zeros((out_len,), dtype=mx.float32)
                 envelope = envelope.at[flat_indices_safe].add(wsq_tiled)
 
+            # Precompute reciprocal envelope (avoids per-thread division in backward kernel)
+            inv_envelope = mx.where(envelope > 1e-11, 1.0 / envelope, mx.zeros_like(envelope))
+
             @mx.custom_function
             def _ola_and_trim(frames_inner: mx.array) -> mx.array:
                 """Forward: Metal OLA+norm + trim."""
@@ -2181,12 +2208,12 @@ class SpectralTransform:
                 grad_ola = _unpad_cotangent(
                     cotangent, center, n_fft, out_len, length_int, B,
                 )
-                # Metal gather backward: grad_frames[b,n,f] = grad_ola[b, n*hop+f] * win[f] / env[n*hop+f]
+                # Metal gather backward: grad_frames[b,n,f] = grad_ola[b, n*hop+f] * win[f] * inv_env[n*hop+f]
                 bwd_params = mx.array([n_frames_int, out_len], dtype=mx.int32)
                 grad_ola_c = mx.contiguous(grad_ola)
                 tmpl = [("T", grad_ola_c.dtype), ("NFFT", n_fft), ("HOP", hop_length)]
                 grad_frames = bwd_kernel(
-                    inputs=[grad_ola_c, window, envelope, bwd_params],
+                    inputs=[grad_ola_c, window, inv_envelope, bwd_params],
                     template=tmpl,
                     output_shapes=[(B, n_frames_int, n_fft)],
                     output_dtypes=[grad_ola_c.dtype],
