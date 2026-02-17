@@ -55,7 +55,6 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           attestations: false
-          verbose: true
 
   smoke-macos:
     name: Smoke install from TestPyPI (macOS)
