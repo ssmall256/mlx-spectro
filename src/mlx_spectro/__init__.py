@@ -1,6 +1,6 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.2.0rc3"
+__version__ = "0.2.0rc4"
 
 from .spectral_ops import (
     ISTFTBackendPolicy,
