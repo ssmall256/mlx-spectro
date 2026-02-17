@@ -92,7 +92,7 @@ jobs:
           z = t.stft(x, output_layout='bnf')
           y = t.istft(z, length=4096, input_layout='bnf')
           mx.eval(z, y)
-          assert z.shape == (1, 13, 513), f'unexpected stft shape: {z.shape}'
+          assert z.shape == (1, 17, 513), f'unexpected stft shape: {z.shape}'
           assert y.shape == (1, 4096), f'unexpected istft shape: {y.shape}'
           print(f'mlx-spectro {PACKAGE_VERSION} smoke test passed')
           " 2>&1 | head -20
