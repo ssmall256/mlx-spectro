@@ -9,7 +9,7 @@ description = "High-performance STFT/iSTFT for Apple MLX with fused Metal kernel
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Sam", email = "ssmall256@users.noreply.github.com" }]
+authors = [{ name = "ssmall256", email = "ssmall256@users.noreply.github.com" }]
 keywords = ["mlx", "stft", "istft", "spectral", "audio", "dsp", "apple-silicon"]
 classifiers = [
     "Development Status :: 4 - Beta",
