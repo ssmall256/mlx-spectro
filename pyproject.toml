@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-spectro"
-version = "0.2.1"
+version = "0.2.2rc1"
 description = "High-performance STFT/iSTFT for Apple MLX with fused Metal kernels"
 readme = "README.md"
 license = "MIT"
