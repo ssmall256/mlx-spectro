@@ -11,6 +11,19 @@ spec = transform.stft(audio)                      # [B, T] → complex spectrogr
 reconstructed = transform.istft(spec, length=T)    # complex spectrogram → [B, T]
 ```
 
+```python
+from mlx_spectro import MelSpectrogramTransform
+
+mel = MelSpectrogramTransform(
+    sample_rate=24000,
+    n_fft=2048,
+    hop_length=240,
+    n_mels=128,
+    mode="torchaudio_compat",
+)
+mel_db = mel(audio)  # [B, n_mels, frames]
+```
+
 [mlx-audio-separator](https://github.com/ssmall256/mlx-audio-separator) uses mlx-spectro for MLX-native stem separation (Roformer, MDX, Demucs) and runs **1.8–3.1x faster end-to-end** than python-audio-separator on torch+MPS. See [benchmarks](#real-world-mlx-audio-separator) below.
 
 ## Install
@@ -76,6 +89,32 @@ SpectralTransform(
 - `istft(z, length=None, ...)` — Inverse STFT. Returns `[B, T]`.
 - `compiled_pair(length, layout="bnf", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
+
+### `MelSpectrogramTransform`
+
+Mel frontend powered by `SpectralTransform`, with torchaudio-compatible filterbank
+and dB conversion mode for parity-sensitive pipelines.
+
+```python
+MelSpectrogramTransform(
+    sample_rate: int = 24000,
+    n_fft: int = 2048,
+    hop_length: int = 240,
+    win_length: int | None = None,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+    power: float = 2.0,
+    norm: str | None = None,      # None or "slaney"
+    mel_scale: str = "htk",       # "htk" or "slaney"
+    top_db: float | None = 80.0,
+    mode: str = "default",        # "default" or "torchaudio_compat"
+)
+```
+
+**Methods:**
+- `spectrogram(x)` — Returns power spectrogram `[B, F, N]`.
+- `mel_spectrogram(x, to_db=True)` / `__call__(x, to_db=True)` — Returns `[B, n_mels, N]`.
 
 ### `get_transform_mlx(**kwargs)`
 

@@ -14,10 +14,16 @@ import mlx.core as mx
 
 __all__ = [
     "SpectralTransform",
+    "MelSpectrogramTransform",
     "ISTFTBackendPolicy",
     "STFTOutputLayout",
+    "MelScale",
+    "MelNorm",
+    "MelMode",
     "WindowLike",
     "make_window",
+    "melscale_fbanks",
+    "amplitude_to_db",
     "resolve_fft_params",
     "get_transform_mlx",
     "spec_mlx_device_key",
@@ -40,6 +46,9 @@ import numpy as np
 
 ISTFTBackendPolicy = Literal["auto", "mlx_fft", "metal", "torch_fallback"]
 STFTOutputLayout = Literal["bfn", "bnf"]
+MelScale = Literal["htk", "slaney"]
+MelNorm = Literal["slaney"] | None
+MelMode = Literal["default", "torchaudio_compat"]
 
 _CACHE_STATS_ENABLED = (
     os.environ.get("SPEC_MLX_CACHE_STATS", "0").lower()
@@ -1505,6 +1514,140 @@ def resolve_fft_params(
     return effective_n_fft, hop_length, win_length
 
 
+def _hz_to_mel(freq: np.ndarray | float, *, mel_scale: str = "htk") -> np.ndarray:
+    if mel_scale not in ("htk", "slaney"):
+        raise ValueError('mel_scale must be one of {"htk", "slaney"}')
+
+    f = np.asarray(freq, dtype=np.float64)
+    if mel_scale == "htk":
+        return 2595.0 * np.log10(1.0 + (f / 700.0))
+
+    # Slaney mel scale.
+    f_min = 0.0
+    f_sp = 200.0 / 3.0
+    mels = (f - f_min) / f_sp
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+    log_t = f >= min_log_hz
+    mels = np.where(log_t, min_log_mel + np.log(f / min_log_hz) / logstep, mels)
+    return mels
+
+
+def _mel_to_hz(mels: np.ndarray, *, mel_scale: str = "htk") -> np.ndarray:
+    if mel_scale not in ("htk", "slaney"):
+        raise ValueError('mel_scale must be one of {"htk", "slaney"}')
+
+    m = np.asarray(mels, dtype=np.float64)
+    if mel_scale == "htk":
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    # Slaney mel scale.
+    f_min = 0.0
+    f_sp = 200.0 / 3.0
+    freqs = f_min + f_sp * m
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+    log_t = m >= min_log_mel
+    freqs = np.where(log_t, min_log_hz * np.exp(logstep * (m - min_log_mel)), freqs)
+    return freqs
+
+
+def melscale_fbanks(
+    n_freqs: int,
+    f_min: float,
+    f_max: float,
+    n_mels: int,
+    sample_rate: int,
+    *,
+    norm: MelNorm = None,
+    mel_scale: MelScale = "htk",
+) -> mx.array:
+    """Create triangular mel filter banks with torchaudio-compatible formulas.
+
+    Returns shape ``[n_freqs, n_mels]`` so mel application is ``X @ fb`` where
+    ``X`` is ``[..., n_freqs]``.
+    """
+    n_freqs = int(n_freqs)
+    n_mels = int(n_mels)
+    sample_rate = int(sample_rate)
+    if n_freqs <= 0:
+        raise ValueError("n_freqs must be > 0")
+    if n_mels <= 0:
+        raise ValueError("n_mels must be > 0")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be > 0")
+    if norm not in (None, "slaney"):
+        raise ValueError('norm must be one of {None, "slaney"}')
+    if mel_scale not in ("htk", "slaney"):
+        raise ValueError('mel_scale must be one of {"htk", "slaney"}')
+
+    all_freqs = np.linspace(0.0, sample_rate // 2, n_freqs, dtype=np.float64)
+    m_min = float(_hz_to_mel(float(f_min), mel_scale=mel_scale))
+    m_max = float(_hz_to_mel(float(f_max), mel_scale=mel_scale))
+    m_pts = np.linspace(m_min, m_max, n_mels + 2, dtype=np.float64)
+    f_pts = _mel_to_hz(m_pts, mel_scale=mel_scale)
+
+    f_diff = f_pts[1:] - f_pts[:-1]  # [n_mels + 1]
+    slopes = f_pts[None, :] - all_freqs[:, None]  # [n_freqs, n_mels + 2]
+    down = (-slopes[:, :-2]) / np.maximum(f_diff[:-1][None, :], 1e-12)
+    up = slopes[:, 2:] / np.maximum(f_diff[1:][None, :], 1e-12)
+    fb = np.maximum(0.0, np.minimum(down, up)).astype(np.float32)  # [n_freqs, n_mels]
+
+    if norm == "slaney":
+        enorm = 2.0 / np.maximum(f_pts[2 : n_mels + 2] - f_pts[:n_mels], 1e-12)
+        fb = fb * enorm[None, :].astype(np.float32)
+
+    return mx.array(fb, dtype=mx.float32)
+
+
+def amplitude_to_db(
+    x: mx.array,
+    *,
+    stype: Literal["power", "magnitude"] = "power",
+    top_db: Optional[float] = 80.0,
+    amin: float = 1e-10,
+    ref_value: float = 1.0,
+) -> mx.array:
+    """Convert power/magnitude spectrogram to dB with torchaudio-compatible semantics."""
+    if stype not in ("power", "magnitude"):
+        raise ValueError('stype must be one of {"power", "magnitude"}')
+    if top_db is not None and float(top_db) < 0:
+        raise ValueError("top_db must be non-negative when set")
+    multiplier = 10.0 if stype == "power" else 20.0
+    amin_f = float(amin)
+    db_multiplier = math.log10(max(amin_f, float(ref_value)))
+
+    x_db = multiplier * mx.log10(mx.maximum(x, mx.array(amin_f, dtype=x.dtype)))
+    x_db = x_db - (multiplier * db_multiplier)
+
+    if top_db is None:
+        return x_db
+
+    shape = tuple(int(v) for v in x_db.shape)
+    if len(shape) <= 1:
+        cutoff = mx.max(x_db) - float(top_db)
+        return mx.maximum(x_db, cutoff)
+    if len(shape) == 2:
+        x_view = x_db[None, None, :, :]
+        max_ref = mx.max(x_view, axis=(-3, -2, -1), keepdims=True)
+        x_view = mx.maximum(x_view, max_ref - float(top_db))
+        return x_view[0, 0, :, :]
+    if len(shape) == 3:
+        x_view = x_db[None, :, :, :]
+        max_ref = mx.max(x_view, axis=(-3, -2, -1), keepdims=True)
+        x_view = mx.maximum(x_view, max_ref - float(top_db))
+        return x_view[0, :, :, :]
+
+    packed_channels = int(shape[-3])
+    leading = int(np.prod(shape[:-3], dtype=np.int64))
+    x_view = x_db.reshape(leading, packed_channels, shape[-2], shape[-1])
+    max_ref = mx.max(x_view, axis=(-3, -2, -1), keepdims=True)
+    x_view = mx.maximum(x_view, max_ref - float(top_db))
+    return x_view.reshape(shape)
+
+
 _ISTFT_BACKEND_POLICIES = ("auto", "mlx_fft", "metal", "torch_fallback")
 _STFT_OUTPUT_LAYOUTS = ("bfn", "bnf")
 
@@ -2795,6 +2938,114 @@ class SpectralTransform:
                 stacklevel=2,
             )
             return None
+
+
+class MelSpectrogramTransform:
+    """Mel spectrogram frontend built on top of :class:`SpectralTransform`.
+
+    ``mode="torchaudio_compat"`` uses torchaudio-compatible mel bank and dB
+    conversion semantics (including ``top_db`` clipping).
+    """
+
+    __slots__ = (
+        "sample_rate",
+        "n_fft",
+        "hop_length",
+        "win_length",
+        "n_mels",
+        "f_min",
+        "f_max",
+        "power",
+        "norm",
+        "mel_scale",
+        "mode",
+        "top_db",
+        "spectral",
+        "mel_fb",
+    )
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 24_000,
+        n_fft: int = 2_048,
+        hop_length: int = 240,
+        win_length: Optional[int] = None,
+        n_mels: int = 128,
+        f_min: float = 0.0,
+        f_max: Optional[float] = None,
+        power: float = 2.0,
+        norm: MelNorm = None,
+        mel_scale: MelScale = "htk",
+        top_db: Optional[float] = 80.0,
+        mode: MelMode = "default",
+        window_fn: str = "hann",
+        periodic: bool = True,
+        center: bool = True,
+        normalized: bool = False,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.win_length = int(win_length) if win_length is not None else int(n_fft)
+        self.n_mels = int(n_mels)
+        self.f_min = float(f_min)
+        self.f_max = float(self.sample_rate // 2 if f_max is None else f_max)
+        self.power = float(power)
+        self.norm = norm
+        self.mel_scale = mel_scale
+        self.mode = mode
+        self.top_db = top_db
+        if self.mode not in ("default", "torchaudio_compat"):
+            raise ValueError('mode must be one of {"default", "torchaudio_compat"}')
+        if self.power <= 0:
+            raise ValueError("power must be > 0")
+
+        self.spectral = SpectralTransform(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window_fn=window_fn,
+            periodic=periodic,
+            center=center,
+            normalized=normalized,
+        )
+        self.mel_fb = melscale_fbanks(
+            n_freqs=(self.n_fft // 2 + 1),
+            f_min=self.f_min,
+            f_max=self.f_max,
+            n_mels=self.n_mels,
+            sample_rate=self.sample_rate,
+            norm=self.norm,
+            mel_scale=self.mel_scale,
+        )
+
+    def spectrogram(self, x: mx.array) -> mx.array:
+        """Return power spectrogram in ``[B, F, N]`` layout."""
+        spec_bnf = self.spectral.stft(x, output_layout="bnf")
+        mag = mx.abs(spec_bnf)
+        if self.power == 1.0:
+            power = mag
+        elif self.power == 2.0:
+            power = mag * mag
+        else:
+            power = mag ** self.power
+        return mx.transpose(power.astype(mx.float32), (0, 2, 1))
+
+    def mel_spectrogram(self, x: mx.array, *, to_db: bool = True) -> mx.array:
+        """Compute mel spectrogram, returning ``[B, n_mels, frames]``."""
+        p_bfn = self.spectrogram(x)
+        p_bnf = mx.transpose(p_bfn, (0, 2, 1))  # [B,N,F]
+        mel_bnm = mx.matmul(p_bnf, self.mel_fb)  # [B,N,M]
+        mel_bmn = mx.transpose(mel_bnm, (0, 2, 1)).astype(mx.float32)
+        if not to_db:
+            return mel_bmn
+        # Use torchaudio-compatible dB conversion in both modes; "default" just
+        # retains existing defaults (power + top_db=80).
+        return amplitude_to_db(mel_bmn, stype="power", top_db=self.top_db)
+
+    def __call__(self, x: mx.array, *, to_db: bool = True) -> mx.array:
+        return self.mel_spectrogram(x, to_db=to_db)
 
 
 # ==============================================================================
