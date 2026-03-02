@@ -22,6 +22,7 @@ import platform
 import sys
 import time
 import warnings
+from statistics import median
 
 import mlx.core as mx
 import numpy as np
@@ -77,6 +78,29 @@ def bench_mps(fn, *, warmup: int = 5, iters: int = 20) -> float:
         times.append((time.perf_counter() - t0) * 1e3)
     times.sort()
     return times[len(times) // 2]
+
+
+def bench_trimmed(fn, *, warmup: int = 5, iters: int = 20) -> float:
+    """Return median latency in ms using 20% trimmed samples.
+
+    This is used by dispatch profiling to reduce the influence of
+    occasional one-off runtime spikes.
+    """
+    for _ in range(warmup):
+        out = fn()
+        mx.eval(out)
+
+    samples: list[float] = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn()
+        mx.eval(out)
+        samples.append((time.perf_counter() - t0) * 1e3)
+
+    samples.sort()
+    trim = max(1, len(samples) // 5)
+    trimmed = samples[trim:-trim] if len(samples) > (2 * trim) else samples
+    return float(median(trimmed))
 
 # ---------------------------------------------------------------------------
 # Configurations
@@ -470,6 +494,90 @@ def bench_roundtrip_backward(warmup: int, iters: int) -> None:
         rows.append(row)
     _print_timing_table("Roundtrip (STFT → iSTFT) Forward + Backward", cols, rows)
 
+
+# ---------------------------------------------------------------------------
+# Dispatch profiling
+# ---------------------------------------------------------------------------
+
+def bench_dispatch_profile(warmup: int, iters: int, *, n_fft: int = 2048, hop: int = 512) -> None:
+    """Profile eager vs compiled STFT/iSTFT against FFT-only floors."""
+    print("\n### Dispatch Profile\n")
+
+    configs = [
+        ("B=4 T=160k", 4, 160_000),
+        ("B=4 T=1.3M", 4, 1_300_000),
+        ("B=8 T=480k", 8, 480_000),
+    ]
+
+    stft_rows: list[dict] = []
+    istft_rows: list[dict] = []
+
+    for label, batch, length in configs:
+        audio = mx.random.normal((batch, length))
+        mx.eval(audio)
+
+        transform = SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann")
+        stft_pair, istft_pair = transform.compiled_pair(layout="bnf", length=length)
+
+        eager_stft_ms = bench_trimmed(lambda: transform.stft(audio, output_layout="bnf"), warmup=warmup, iters=iters)
+        compiled_stft_ms = bench_trimmed(lambda: stft_pair(audio), warmup=warmup, iters=iters)
+
+        spec = transform.stft(audio, output_layout="bnf")
+        mx.eval(spec)
+        frame_count = spec.shape[1]
+        frames = mx.random.normal((batch, frame_count, n_fft))
+        mx.eval(frames)
+        fft_floor_ms = bench_trimmed(lambda: mx.fft.rfft(frames, axis=-1), warmup=warmup, iters=iters)
+
+        stft_rows.append(
+            {
+                "label": label,
+                "eager": eager_stft_ms,
+                "compiled": compiled_stft_ms,
+                "fft_floor": fft_floor_ms,
+                "dispatch": max(0.0, eager_stft_ms - compiled_stft_ms),
+            }
+        )
+
+        eager_istft_ms = bench_trimmed(
+            lambda: transform.istft(spec, length=length, input_layout="bnf"),
+            warmup=warmup,
+            iters=iters,
+        )
+        compiled_istft_ms = bench_trimmed(lambda: istft_pair(spec), warmup=warmup, iters=iters)
+        ifft_floor_ms = bench_trimmed(lambda: mx.fft.irfft(spec, n=n_fft, axis=-1), warmup=warmup, iters=iters)
+
+        istft_rows.append(
+            {
+                "label": label,
+                "eager": eager_istft_ms,
+                "compiled": compiled_istft_ms,
+                "ifft_floor": ifft_floor_ms,
+                "dispatch": max(0.0, eager_istft_ms - compiled_istft_ms),
+            }
+        )
+
+    print(f"STFT dispatch profile (n_fft={n_fft}, hop={hop})")
+    print("| Config | Eager (ms) | Compiled (ms) | FFT floor (ms) | Dispatch est (ms) | Compiled speedup |")
+    print("|---|--:|--:|--:|--:|--:|")
+    for row in stft_rows:
+        speedup = row["eager"] / max(row["compiled"], 1e-6)
+        print(
+            f"| {row['label']} | {row['eager']:.3f} | {row['compiled']:.3f} | "
+            f"{row['fft_floor']:.3f} | {row['dispatch']:.3f} | {speedup:.2f}x |"
+        )
+
+    print()
+    print(f"iSTFT dispatch profile (n_fft={n_fft}, hop={hop})")
+    print("| Config | Eager (ms) | Compiled (ms) | iFFT floor (ms) | Dispatch est (ms) | Compiled speedup |")
+    print("|---|--:|--:|--:|--:|--:|")
+    for row in istft_rows:
+        speedup = row["eager"] / max(row["compiled"], 1e-6)
+        print(
+            f"| {row['label']} | {row['eager']:.3f} | {row['compiled']:.3f} | "
+            f"{row['ifft_floor']:.3f} | {row['dispatch']:.3f} | {speedup:.2f}x |"
+        )
+
 # ---------------------------------------------------------------------------
 # Table printing
 # ---------------------------------------------------------------------------
@@ -544,6 +652,15 @@ def main() -> None:
                         help="Run forward benchmarks only")
     parser.add_argument("--backward", action="store_true",
                         help="Run backward benchmarks only")
+    parser.add_argument(
+        "--dispatch-profile",
+        action="store_true",
+        help="Run focused eager-vs-compiled dispatch profiling",
+    )
+    parser.add_argument("--dispatch-nfft", type=int, default=2048,
+                        help="FFT size for --dispatch-profile")
+    parser.add_argument("--dispatch-hop", type=int, default=512,
+                        help="Hop length for --dispatch-profile")
     args = parser.parse_args()
 
     warmup = 3 if args.quick else 5
@@ -569,6 +686,15 @@ def main() -> None:
 
     run_forward = not args.backward
     run_backward = not args.forward
+
+    if args.dispatch_profile:
+        bench_dispatch_profile(
+            warmup,
+            iters,
+            n_fft=args.dispatch_nfft,
+            hop=args.dispatch_hop,
+        )
+        return
 
     if run_forward:
         bench_stft_forward(warmup, iters)

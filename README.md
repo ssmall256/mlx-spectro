@@ -19,6 +19,7 @@ mel = MelSpectrogramTransform(
     n_fft=2048,
     hop_length=240,
     n_mels=128,
+    top_db=80.0,
     mode="torchaudio_compat",
 )
 mel_db = mel(audio)  # [B, n_mels, frames]
@@ -92,8 +93,7 @@ SpectralTransform(
 
 ### `MelSpectrogramTransform`
 
-Mel frontend powered by `SpectralTransform`, with torchaudio-compatible filterbank
-and dB conversion mode for parity-sensitive pipelines.
+Mel frontend powered by `SpectralTransform`.
 
 ```python
 MelSpectrogramTransform(
@@ -108,13 +108,17 @@ MelSpectrogramTransform(
     norm: str | None = None,      # None or "slaney"
     mel_scale: str = "htk",       # "htk" or "slaney"
     top_db: float | None = 80.0,
-    mode: str = "default",        # "default" or "torchaudio_compat"
+    mode: str = "mlx_native",     # "mlx_native" or "torchaudio_compat"; "default" alias -> "mlx_native"
 )
 ```
 
 **Methods:**
 - `spectrogram(x)` — Returns power spectrogram `[B, F, N]`.
 - `mel_spectrogram(x, to_db=True)` / `__call__(x, to_db=True)` — Returns `[B, n_mels, N]`.
+
+**Mode semantics:**
+- `mode="mlx_native"`: per-example `top_db` clipping (batch-independent behavior).
+- `mode="torchaudio_compat"`: torchaudio-compatible packed-batch clipping semantics for parity-sensitive pipelines.
 
 ### `get_transform_mlx(**kwargs)`
 
@@ -170,7 +174,9 @@ Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
 | B=4 T=160k nfft=2048 | 2.86e-06 | 5.25e-06 |
 | B=8 T=480k nfft=1024 | 3.81e-06 | 4.77e-06 |
 
-To reproduce: `python scripts/benchmark.py`
+To reproduce:
+- Full suite: `python scripts/benchmark.py`
+- Dispatch overhead profile: `python scripts/benchmark.py --dispatch-profile`
 
 ### Real-world: mlx-audio-separator
 

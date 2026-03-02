@@ -48,7 +48,7 @@ ISTFTBackendPolicy = Literal["auto", "mlx_fft", "metal", "torch_fallback"]
 STFTOutputLayout = Literal["bfn", "bnf"]
 MelScale = Literal["htk", "slaney"]
 MelNorm = Literal["slaney"] | None
-MelMode = Literal["default", "torchaudio_compat"]
+MelMode = Literal["mlx_native", "torchaudio_compat", "default"]
 
 _CACHE_STATS_ENABLED = (
     os.environ.get("SPEC_MLX_CACHE_STATS", "0").lower()
@@ -1530,7 +1530,8 @@ def _hz_to_mel(freq: np.ndarray | float, *, mel_scale: str = "htk") -> np.ndarra
     min_log_mel = (min_log_hz - f_min) / f_sp
     logstep = math.log(6.4) / 27.0
     log_t = f >= min_log_hz
-    mels = np.where(log_t, min_log_mel + np.log(f / min_log_hz) / logstep, mels)
+    log_mels = min_log_mel + np.log(np.maximum(f, 1e-12) / min_log_hz) / logstep
+    mels = np.where(log_t, log_mels, mels)
     return mels
 
 
@@ -1609,10 +1610,18 @@ def amplitude_to_db(
     top_db: Optional[float] = 80.0,
     amin: float = 1e-10,
     ref_value: float = 1.0,
+    mode: Literal["torchaudio_compat", "per_example"] = "torchaudio_compat",
 ) -> mx.array:
-    """Convert power/magnitude spectrogram to dB with torchaudio-compatible semantics."""
+    """Convert power/magnitude spectrogram to dB.
+
+    ``mode="torchaudio_compat"`` replicates torchaudio's clipping behavior for
+    packed batch tensors. ``mode="per_example"`` clips each leading example
+    independently across time-frequency axes.
+    """
     if stype not in ("power", "magnitude"):
         raise ValueError('stype must be one of {"power", "magnitude"}')
+    if mode not in ("torchaudio_compat", "per_example"):
+        raise ValueError('mode must be one of {"torchaudio_compat", "per_example"}')
     if top_db is not None and float(top_db) < 0:
         raise ValueError("top_db must be non-negative when set")
     multiplier = 10.0 if stype == "power" else 20.0
@@ -1626,6 +1635,16 @@ def amplitude_to_db(
         return x_db
 
     shape = tuple(int(v) for v in x_db.shape)
+    if mode == "per_example":
+        if len(shape) <= 1:
+            cutoff = mx.max(x_db) - float(top_db)
+            return mx.maximum(x_db, cutoff)
+        if len(shape) == 2:
+            max_ref = mx.max(x_db, keepdims=True)
+            return mx.maximum(x_db, max_ref - float(top_db))
+        max_ref = mx.max(x_db, axis=(-2, -1), keepdims=True)
+        return mx.maximum(x_db, max_ref - float(top_db))
+
     if len(shape) <= 1:
         cutoff = mx.max(x_db) - float(top_db)
         return mx.maximum(x_db, cutoff)
@@ -2943,8 +2962,10 @@ class SpectralTransform:
 class MelSpectrogramTransform:
     """Mel spectrogram frontend built on top of :class:`SpectralTransform`.
 
-    ``mode="torchaudio_compat"`` uses torchaudio-compatible mel bank and dB
-    conversion semantics (including ``top_db`` clipping).
+    Modes:
+    - ``mlx_native``: per-example ``top_db`` clipping (batch-independent).
+    - ``torchaudio_compat``: torchaudio-compatible packed-batch clipping.
+    - ``default``: compatibility alias of ``mlx_native``.
     """
 
     __slots__ = (
@@ -2978,7 +2999,7 @@ class MelSpectrogramTransform:
         norm: MelNorm = None,
         mel_scale: MelScale = "htk",
         top_db: Optional[float] = 80.0,
-        mode: MelMode = "default",
+        mode: MelMode = "mlx_native",
         window_fn: str = "hann",
         periodic: bool = True,
         center: bool = True,
@@ -2994,10 +3015,13 @@ class MelSpectrogramTransform:
         self.power = float(power)
         self.norm = norm
         self.mel_scale = mel_scale
-        self.mode = mode
+        mode_name = str(mode)
+        if mode_name == "default":
+            mode_name = "mlx_native"
+        self.mode = mode_name
         self.top_db = top_db
-        if self.mode not in ("default", "torchaudio_compat"):
-            raise ValueError('mode must be one of {"default", "torchaudio_compat"}')
+        if self.mode not in ("mlx_native", "torchaudio_compat"):
+            raise ValueError('mode must be one of {"mlx_native", "torchaudio_compat", "default"}')
         if self.power <= 0:
             raise ValueError("power must be > 0")
 
@@ -3040,9 +3064,10 @@ class MelSpectrogramTransform:
         mel_bmn = mx.transpose(mel_bnm, (0, 2, 1)).astype(mx.float32)
         if not to_db:
             return mel_bmn
-        # Use torchaudio-compatible dB conversion in both modes; "default" just
-        # retains existing defaults (power + top_db=80).
-        return amplitude_to_db(mel_bmn, stype="power", top_db=self.top_db)
+        db_mode: Literal["torchaudio_compat", "per_example"] = (
+            "torchaudio_compat" if self.mode == "torchaudio_compat" else "per_example"
+        )
+        return amplitude_to_db(mel_bmn, stype="power", top_db=self.top_db, mode=db_mode)
 
     def __call__(self, x: mx.array, *, to_db: bool = True) -> mx.array:
         return self.mel_spectrogram(x, to_db=to_db)
