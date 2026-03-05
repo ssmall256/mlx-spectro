@@ -536,6 +536,43 @@ out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)grad_val;
 # ~60 MB, and can regress below that.  100 MB is a safe crossover point.
 _TILED_FRAME_EXTRACT_BYTE_THRESHOLD = 100_000_000  # ~100 MB
 
+# --- 7) Metal Kernel: Fused power spectrum ---
+# Reads interleaved complex64 data (viewed as float32) and computes re²+im²
+# in a single pass, avoiding the sqrt in mx.abs and eliminating intermediate
+# buffers.  Grid: (total_complex_elements, 1, 1).
+_METAL_POWER_SPECTRUM_TEMPLATE = """
+uint i = thread_position_in_grid.x;
+uint total = (uint)params[0];
+if (i >= total) return;
+float re = z_flat[2 * i];
+float im = z_flat[2 * i + 1];
+out[i] = re * re + im * im;
+"""
+
+
+class _PowerSpectrumCache:
+    """Singleton for the fused power-spectrum Metal kernel."""
+    _lock = threading.Lock()
+    _kernel: object = None
+
+    @classmethod
+    def get(cls):
+        if cls._kernel is not None:
+            return cls._kernel
+        with cls._lock:
+            if cls._kernel is not None:
+                return cls._kernel
+            try:
+                cls._kernel = mx.fast.metal_kernel(
+                    name="fused_power_spectrum",
+                    input_names=["z_flat", "params"],
+                    output_names=["out"],
+                    source=_METAL_POWER_SPECTRUM_TEMPLATE,
+                )
+            except Exception:
+                cls._kernel = False
+            return cls._kernel
+
 
 class _FrameExtractCache:
     """Singleton for the fused frame-extraction Metal kernels (simple + tiled)."""
@@ -1628,7 +1665,7 @@ def amplitude_to_db(
     amin_f = float(amin)
     db_multiplier = math.log10(max(amin_f, float(ref_value)))
 
-    x_db = multiplier * mx.log10(mx.maximum(x, mx.array(amin_f, dtype=x.dtype)))
+    x_db = multiplier * mx.log10(mx.maximum(x, amin_f))
     x_db = x_db - (multiplier * db_multiplier)
 
     if top_db is None:
@@ -1738,11 +1775,9 @@ def _trim_ola_output(
             start = pad
             end = min(out_len, start + target)
             out = out[:, start:end]
-            if int(out.shape[1]) < target:
-                out = mx.concatenate(
-                    [out, mx.zeros((B, target - int(out.shape[1])), dtype=out.dtype)],
-                    axis=1,
-                )
+            shortfall = target - int(out.shape[1])
+            if shortfall > 0:
+                out = mx.pad(out, [(0, 0), (0, shortfall)])
         else:
             out = out[:, pad:-pad] if out_len > 2 * pad else out[:, :0]
     elif length_int is not None:
@@ -1750,10 +1785,7 @@ def _trim_ola_output(
         if out_len >= target:
             out = out[:, :target]
         else:
-            out = mx.concatenate(
-                [out, mx.zeros((B, target - out_len), dtype=out.dtype)],
-                axis=1,
-            )
+            out = mx.pad(out, [(0, 0), (0, target - out_len)])
     return out
 
 
@@ -2856,32 +2888,15 @@ class SpectralTransform:
                 target = int(length)
                 end = min(int(out.shape[1]), start + target)
                 out = out[:, start:end]
-                if int(out.shape[1]) < target:
-                    out = mx.concatenate(
-                        [
-                            out,
-                            mx.zeros(
-                                (int(out.shape[0]), target - int(out.shape[1])),
-                                dtype=out.dtype,
-                            ),
-                        ],
-                        axis=1,
-                    )
+                shortfall = target - int(out.shape[1])
+                if shortfall > 0:
+                    out = mx.pad(out, [(0, 0), (0, shortfall)])
         elif length is not None:
             target = int(length)
             if int(out.shape[1]) >= target:
                 out = out[:, :target]
             else:
-                out = mx.concatenate(
-                    [
-                        out,
-                        mx.zeros(
-                            (int(out.shape[0]), target - int(out.shape[1])),
-                            dtype=out.dtype,
-                        ),
-                    ],
-                    axis=1,
-                )
+                out = mx.pad(out, [(0, 0), (0, target - int(out.shape[1]))])
 
         if orig_2d_input:
             out = out[0]
@@ -3044,9 +3059,30 @@ class MelSpectrogramTransform:
             mel_scale=self.mel_scale,
         )
 
-    def spectrogram(self, x: mx.array) -> mx.array:
-        """Return power spectrogram in ``[B, F, N]`` layout."""
+    def _power_spectrogram_bnf(self, x: mx.array) -> mx.array:
+        """Return power spectrogram in ``[B, N, F]`` layout (internal)."""
         spec_bnf = self.spectral.stft(x, output_layout="bnf")
+
+        # Fast path for power=2: fused Metal kernel computes re²+im² in a
+        # single pass, avoiding the sqrt in mx.abs and the intermediate
+        # magnitude buffer.
+        if self.power == 2.0:
+            kernel = _PowerSpectrumCache.get()
+            if kernel and kernel is not False:
+                B, N, F = spec_bnf.shape
+                total = int(B) * int(N) * int(F)
+                z_flat = spec_bnf.view(mx.float32)
+                params = mx.array([total], dtype=mx.int32)
+                result = kernel(
+                    inputs=[z_flat, params],
+                    template=[],
+                    grid=(total, 1, 1),
+                    threadgroup=(min(256, total), 1, 1),
+                    output_shapes=[(total,)],
+                    output_dtypes=[mx.float32],
+                )[0]
+                return result.reshape(int(B), int(N), int(F))
+
         mag = mx.abs(spec_bnf)
         if self.power == 1.0:
             power = mag
@@ -3054,12 +3090,15 @@ class MelSpectrogramTransform:
             power = mag * mag
         else:
             power = mag ** self.power
-        return mx.transpose(power.astype(mx.float32), (0, 2, 1))
+        return power.astype(mx.float32)
+
+    def spectrogram(self, x: mx.array) -> mx.array:
+        """Return power spectrogram in ``[B, F, N]`` layout."""
+        return mx.transpose(self._power_spectrogram_bnf(x), (0, 2, 1))
 
     def mel_spectrogram(self, x: mx.array, *, to_db: bool = True) -> mx.array:
         """Compute mel spectrogram, returning ``[B, n_mels, frames]``."""
-        p_bfn = self.spectrogram(x)
-        p_bnf = mx.transpose(p_bfn, (0, 2, 1))  # [B,N,F]
+        p_bnf = self._power_spectrogram_bnf(x)  # [B,N,F] — no redundant transposes
         mel_bnm = mx.matmul(p_bnf, self.mel_fb)  # [B,N,M]
         mel_bmn = mx.transpose(mel_bnm, (0, 2, 1)).astype(mx.float32)
         if not to_db:
