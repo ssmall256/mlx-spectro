@@ -3113,6 +3113,121 @@ class MelSpectrogramTransform:
 
 
 # ==============================================================================
+# Onset Strength (Spectral Flux)
+# ==============================================================================
+
+
+def onset_strength_multi(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: Optional[float] = None,
+    center: bool = True,
+    lag: int = 1,
+    norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: Optional[float] = 80.0,
+) -> mx.array:
+    """Per-band half-wave rectified spectral flux of a dB-scaled mel spectrogram.
+
+    Like ``onset_strength`` but returns per-mel-band curves *before*
+    averaging across frequency.  Returns shape ``[n_mels, frames]`` for
+    1-D input or ``[B, n_mels, frames]`` for batched input.
+    """
+    sample_rate = int(sample_rate)
+    n_fft = int(n_fft)
+    hop_length = int(hop_length)
+    n_mels = int(n_mels)
+    lag = int(lag)
+    if lag < 1:
+        raise ValueError("lag must be >= 1")
+
+    squeezed = x.ndim == 1
+    if squeezed:
+        x = x[None, :]
+
+    mel_tr = MelSpectrogramTransform(
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        f_min=f_min,
+        f_max=f_max,
+        power=2.0,
+        norm=norm,
+        mel_scale=mel_scale,
+        top_db=top_db,
+        mode="mlx_native",
+        window_fn="hann",
+        periodic=True,
+        center=center,
+    )
+
+    # [B, n_mels, frames]
+    S = mel_tr.mel_spectrogram(x, to_db=True)
+    n_frames = S.shape[-1]
+
+    # Spectral flux: half-wave rectified lag-difference along time axis
+    flux = mx.maximum(S[..., lag:] - S[..., :-lag], 0.0)  # [B, n_mels, frames-lag]
+
+    # Left-pad to compensate for lag and STFT centering
+    pad_width = lag
+    if center:
+        pad_width += n_fft // (2 * hop_length)
+    flux = mx.pad(flux, [(0, 0), (0, 0), (pad_width, 0)])
+
+    # Trim to match mel spectrogram frame count
+    flux = flux[..., :n_frames]
+
+    if squeezed:
+        flux = flux.squeeze(0)
+    return flux
+
+
+def onset_strength(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: Optional[float] = None,
+    center: bool = True,
+    lag: int = 1,
+    norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: Optional[float] = 80.0,
+) -> mx.array:
+    """Half-wave rectified spectral flux of a dB-scaled mel spectrogram.
+
+    Equivalent to ``onset_strength_multi`` averaged across mel bands.
+    Defaults use Slaney mel scale with Slaney normalization to match
+    librosa's ``onset.onset_strength`` conventions.  Returns shape
+    ``[frames]`` for 1-D input or ``[B, frames]`` for batched input.
+    """
+    multi = onset_strength_multi(
+        x,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        f_min=f_min,
+        f_max=f_max,
+        center=center,
+        lag=lag,
+        norm=norm,
+        mel_scale=mel_scale,
+        top_db=top_db,
+    )
+    return mx.mean(multi, axis=-2)
+
+
+# ==============================================================================
 # Global Cache & Factory
 # ==============================================================================
 

@@ -120,6 +120,14 @@ MelSpectrogramTransform(
 - `mode="mlx_native"`: per-example `top_db` clipping (batch-independent behavior).
 - `mode="torchaudio_compat"`: torchaudio-compatible packed-batch clipping semantics for parity-sensitive pipelines.
 
+### `onset_strength(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ...)`
+
+Half-wave rectified spectral flux of a dB-scaled mel spectrogram, matching librosa `onset.onset_strength` conventions. Returns `[frames]` for 1-D input or `[B, frames]` for batched input.
+
+### `onset_strength_multi(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ...)`
+
+Per-band half-wave rectified spectral flux (before averaging across frequency). Returns `[n_mels, frames]` for 1-D input or `[B, n_mels, frames]` for batched input.
+
 ### `get_transform_mlx(**kwargs)`
 
 Factory that returns cached `SpectralTransform` instances for repeated use.
