@@ -1,6 +1,6 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.3.1rc1"
+__version__ = "0.3.1"
 
 from .spectral_ops import (
     CenterPadMode,
