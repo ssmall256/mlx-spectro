@@ -133,6 +133,73 @@ class TestSTFT:
         with pytest.raises(ValueError, match="1D or 2D"):
             transform.stft(x)
 
+    def test_constant_center_pad_matches_manual_symmetric_padding(self):
+        n_fft = 512
+        hop = 128
+        window = mx.array(np.hanning(n_fft).astype(np.float32))
+        x = mx.random.normal((1, 4000))
+        direct = SpectralTransform(
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
+            periodic=False,
+            center=True,
+            center_pad_mode="constant",
+            center_tail_pad="symmetric",
+        )
+        manual = SpectralTransform(
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
+            periodic=False,
+            center=False,
+        )
+        z_direct = direct.stft(x, output_layout="bnf")
+        z_manual = manual.stft(
+            mx.pad(x, [(0, 0), (n_fft // 2, n_fft // 2)], mode="constant"),
+            output_layout="bnf",
+        )
+        mx.eval(z_direct, z_manual)
+        np.testing.assert_allclose(np.array(z_direct), np.array(z_manual), atol=1e-6)
+
+    def test_constant_center_pad_matches_manual_minimal_padding(self):
+        n_fft = 512
+        hop = 128
+        pad = n_fft // 2
+        window = mx.array(np.hanning(n_fft).astype(np.float32))
+        x = mx.random.normal((1, 4000))
+        direct = SpectralTransform(
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
+            periodic=False,
+            center=True,
+            center_pad_mode="constant",
+            center_tail_pad="minimal",
+        )
+        manual = SpectralTransform(
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
+            periodic=False,
+            center=False,
+        )
+        sig_len = int(x.shape[1])
+        num_frames = max(1, int(math.ceil(sig_len / float(hop))))
+        last_start = (num_frames - 1) * hop - pad
+        pad_right = max(0, last_start + n_fft - sig_len)
+        z_direct = direct.stft(x, output_layout="bnf")
+        z_manual = manual.stft(
+            mx.pad(x, [(0, 0), (pad, pad_right)], mode="constant"),
+            output_layout="bnf",
+        )
+        mx.eval(z_direct, z_manual)
+        np.testing.assert_allclose(np.array(z_direct), np.array(z_manual), atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # SpectralTransform: iSTFT roundtrip
@@ -189,6 +256,19 @@ class TestISTFTRoundtrip:
             np.array(y), np.array(x), atol=1e-4, rtol=1e-4
         )
 
+    def test_minimal_center_tail_requires_length(self):
+        t = SpectralTransform(
+            n_fft=512,
+            hop_length=128,
+            window_fn="hann",
+            center_pad_mode="constant",
+            center_tail_pad="minimal",
+        )
+        x = mx.random.normal((1, 4000))
+        z = t.stft(x, output_layout="bnf")
+        with pytest.raises(ValueError, match="length is required"):
+            t.istft(z, input_layout="bnf")
+
 
 # ---------------------------------------------------------------------------
 # get_transform_mlx caching
@@ -200,6 +280,7 @@ class TestGetTransformCached:
         kwargs = dict(
             n_fft=1024, hop_length=256, win_length=1024,
             window_fn="hann", periodic=True, center=True,
+            center_pad_mode="reflect", center_tail_pad="symmetric",
             normalized=False, window=None,
         )
         t1 = get_transform_mlx(**kwargs)
@@ -210,6 +291,7 @@ class TestGetTransformCached:
         base = dict(
             n_fft=1024, hop_length=256, win_length=1024,
             window_fn="hann", periodic=True, center=True,
+            center_pad_mode="reflect", center_tail_pad="symmetric",
             normalized=False, window=None,
         )
         t1 = get_transform_mlx(**base)
@@ -222,9 +304,26 @@ class TestGetTransformCached:
         t = get_transform_mlx(
             n_fft=1024, hop_length=256, win_length=1024,
             window_fn="hann", periodic=True, center=True,
+            center_pad_mode="reflect", center_tail_pad="symmetric",
             normalized=False, window=w,
         )
         assert isinstance(t, SpectralTransform)
+
+    def test_different_center_padding_config_not_cached(self):
+        base = dict(
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            window_fn="hann",
+            periodic=True,
+            center=True,
+            center_tail_pad="symmetric",
+            normalized=False,
+            window=None,
+        )
+        t1 = get_transform_mlx(**{**base, "center_pad_mode": "reflect"})
+        t2 = get_transform_mlx(**{**base, "center_pad_mode": "constant"})
+        assert t1 is not t2
 
 
 # ---------------------------------------------------------------------------

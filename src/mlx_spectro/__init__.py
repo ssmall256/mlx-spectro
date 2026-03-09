@@ -1,8 +1,10 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 from .spectral_ops import (
+    CenterPadMode,
+    CenterTailPad,
     ISTFTBackendPolicy,
     MelMode,
     MelNorm,
@@ -28,6 +30,8 @@ __all__ = [
     "MelSpectrogramTransform",
     "ISTFTBackendPolicy",
     "STFTOutputLayout",
+    "CenterPadMode",
+    "CenterTailPad",
     "MelScale",
     "MelNorm",
     "MelMode",

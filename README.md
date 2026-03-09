@@ -80,6 +80,8 @@ SpectralTransform(
     window: mx.array | None = None,  # custom window array
     periodic: bool = True,
     center: bool = True,
+    center_pad_mode: str = "reflect",   # "reflect" or "constant"
+    center_tail_pad: str = "symmetric", # "symmetric" or "minimal"
     normalized: bool = False,
     istft_backend_policy: str | None = None,  # "auto", "mlx_fft", "metal", "torch_fallback"
 )
@@ -90,6 +92,50 @@ SpectralTransform(
 - `istft(z, length=None, ...)` — Inverse STFT. Returns `[B, T]`.
 - `compiled_pair(length, layout="bnf", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
+
+**Centering and padding semantics:**
+- `center=True, center_pad_mode="reflect", center_tail_pad="symmetric"`: default PyTorch-style centered STFT with reflect padding on both sides. This keeps the current fused Metal fast path.
+- `center=True, center_pad_mode="constant", center_tail_pad="symmetric"`: centered STFT with zero padding on both sides, matching the common Torch/librosa constant-pad interpretation.
+- `center=True, center_pad_mode="constant", center_tail_pad="minimal"`: centered STFT with zero left padding and only the minimal right padding needed to keep frame count at `ceil(len / hop_length)`. This is useful for madmom-style frontends that should not emit an extra tail frame.
+
+`center_pad_mode="reflect"` currently requires `center_tail_pad="symmetric"`. When using `center_tail_pad="minimal"`, `istft(..., length=...)` must be given an explicit `length`.
+
+### Padding Examples
+
+Torch-style centered zero padding:
+
+```python
+from mlx_spectro import SpectralTransform
+
+transform = SpectralTransform(
+    n_fft=2048,
+    hop_length=512,
+    window_fn="hann",
+    center=True,
+    center_pad_mode="constant",
+    center_tail_pad="symmetric",
+)
+```
+
+madmom-style centered framing without an extra tail frame:
+
+```python
+import mlx.core as mx
+import numpy as np
+from mlx_spectro import SpectralTransform
+
+window = mx.array(np.hanning(8192).astype(np.float32))
+transform = SpectralTransform(
+    n_fft=8192,
+    hop_length=4410,
+    win_length=8192,
+    window=window,
+    periodic=False,
+    center=True,
+    center_pad_mode="constant",
+    center_tail_pad="minimal",
+)
+```
 
 ### `MelSpectrogramTransform`
 
@@ -109,6 +155,8 @@ MelSpectrogramTransform(
     mel_scale: str = "htk",       # "htk" or "slaney"
     top_db: float | None = 80.0,
     mode: str = "mlx_native",     # "mlx_native" or "torchaudio_compat"; "default" alias -> "mlx_native"
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
 )
 ```
 
@@ -120,11 +168,11 @@ MelSpectrogramTransform(
 - `mode="mlx_native"`: per-example `top_db` clipping (batch-independent behavior).
 - `mode="torchaudio_compat"`: torchaudio-compatible packed-batch clipping semantics for parity-sensitive pipelines.
 
-### `onset_strength(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ...)`
+### `onset_strength(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ..., center_pad_mode="reflect", center_tail_pad="symmetric")`
 
 Half-wave rectified spectral flux of a dB-scaled mel spectrogram, matching librosa `onset.onset_strength` conventions. Returns `[frames]` for 1-D input or `[B, frames]` for batched input.
 
-### `onset_strength_multi(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ...)`
+### `onset_strength_multi(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ..., center_pad_mode="reflect", center_tail_pad="symmetric")`
 
 Per-band half-wave rectified spectral flux (before averaging across frequency). Returns `[n_mels, frames]` for 1-D input or `[B, n_mels, frames]` for batched input.
 

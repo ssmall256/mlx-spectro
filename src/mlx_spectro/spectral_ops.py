@@ -17,6 +17,8 @@ __all__ = [
     "MelSpectrogramTransform",
     "ISTFTBackendPolicy",
     "STFTOutputLayout",
+    "CenterPadMode",
+    "CenterTailPad",
     "MelScale",
     "MelNorm",
     "MelMode",
@@ -46,6 +48,8 @@ import numpy as np
 
 ISTFTBackendPolicy = Literal["auto", "mlx_fft", "metal", "torch_fallback"]
 STFTOutputLayout = Literal["bfn", "bnf"]
+CenterPadMode = Literal["reflect", "constant"]
+CenterTailPad = Literal["symmetric", "minimal"]
 MelScale = Literal["htk", "slaney"]
 MelNorm = Literal["slaney"] | None
 MelMode = Literal["mlx_native", "torchaudio_compat", "default"]
@@ -1750,6 +1754,8 @@ class _TransformKey:
     window_fn: str
     periodic: bool
     center: bool
+    center_pad_mode: str
+    center_tail_pad: str
     normalized: bool
     istft_backend_policy: str
 
@@ -1787,6 +1793,49 @@ def _trim_ola_output(
         else:
             out = mx.pad(out, [(0, 0), (0, target - out_len)])
     return out
+
+
+def _center_pad_widths(
+    sig_len: int,
+    n_fft: int,
+    hop_length: int,
+    center_tail_pad: CenterTailPad,
+) -> tuple[int, int]:
+    pad_left = n_fft // 2
+    if center_tail_pad == "symmetric":
+        return pad_left, pad_left
+    if center_tail_pad != "minimal":
+        raise ValueError(
+            "center_tail_pad must be one of {'symmetric', 'minimal'}"
+        )
+    num_frames = max(1, int(math.ceil(sig_len / float(hop_length))))
+    last_start = (num_frames - 1) * hop_length - pad_left
+    pad_right = max(0, last_start + n_fft - sig_len)
+    return pad_left, pad_right
+
+
+def _apply_center_padding(
+    x: mx.array,
+    *,
+    n_fft: int,
+    hop_length: int,
+    center_pad_mode: CenterPadMode,
+    center_tail_pad: CenterTailPad,
+) -> mx.array:
+    pad_left, pad_right = _center_pad_widths(
+        int(x.shape[1]), n_fft, hop_length, center_tail_pad
+    )
+    if center_pad_mode == "reflect":
+        if pad_left != pad_right:
+            raise ValueError(
+                "center_pad_mode='reflect' requires center_tail_pad='symmetric'"
+            )
+        return _torch_like_reflect_pad_1d_compiled(x, pad_left)
+    if center_pad_mode != "constant":
+        raise ValueError(
+            "center_pad_mode must be one of {'reflect', 'constant'}"
+        )
+    return mx.pad(x, [(0, 0), (pad_left, pad_right)], mode="constant")
 
 
 def _unpad_cotangent(
@@ -1830,7 +1879,8 @@ class SpectralTransform:
     """
     __slots__ = (
         'n_fft', 'hop_length', 'win_length', 'window', 'window_fn',
-        '_window_sq', 'center', 'normalized', 'periodic',
+        '_window_sq', 'center', 'center_pad_mode', 'center_tail_pad',
+        'normalized', 'periodic',
         'istft_backend_policy',
         '_window_cache_sig',
         '_norm_factor', '_inv_norm_factor',
@@ -1849,6 +1899,8 @@ class SpectralTransform:
         window: WindowLike = None,
         periodic: bool = True,
         center: bool = True,
+        center_pad_mode: CenterPadMode = "reflect",
+        center_tail_pad: CenterTailPad = "symmetric",
         normalized: bool = False,
         istft_backend_policy: Optional[str] = None,
     ):
@@ -1860,9 +1912,23 @@ class SpectralTransform:
             raise ValueError(f"win_length ({self.win_length}) must be <= n_fft ({self.n_fft})")
 
         self.center = bool(center)
+        self.center_pad_mode = str(center_pad_mode)
+        self.center_tail_pad = str(center_tail_pad)
         self.normalized = bool(normalized)
         self.periodic = bool(periodic)
         self.window_fn = str(window_fn)
+        if self.center_pad_mode not in {"reflect", "constant"}:
+            raise ValueError(
+                "center_pad_mode must be one of {'reflect', 'constant'}"
+            )
+        if self.center_tail_pad not in {"symmetric", "minimal"}:
+            raise ValueError(
+                "center_tail_pad must be one of {'symmetric', 'minimal'}"
+            )
+        if self.center_pad_mode == "reflect" and self.center_tail_pad != "symmetric":
+            raise ValueError(
+                "center_pad_mode='reflect' requires center_tail_pad='symmetric'"
+            )
         self.istft_backend_policy = _resolve_backend_policy(
             istft_backend_policy,
             default_policy=_DEFAULT_ISTFT_BACKEND_POLICY,
@@ -2185,14 +2251,19 @@ class SpectralTransform:
         n_fft = self.n_fft
         hop_length = self.hop_length
         center = self.center
+        center_pad_mode = self.center_pad_mode
+        center_tail_pad = self.center_tail_pad
         window = self.window
 
         B, sig_len = x.shape
 
         # Try Metal backward kernel
-        bwd_kernel = _BackwardKernelCache.get_stft_backward() if center else False
+        use_reflect_fast_path = (
+            center and center_pad_mode == "reflect" and center_tail_pad == "symmetric"
+        )
+        bwd_kernel = _BackwardKernelCache.get_stft_backward() if use_reflect_fast_path else False
 
-        if center and bwd_kernel and bwd_kernel is not False and sig_len >= n_fft:
+        if use_reflect_fast_path and bwd_kernel and bwd_kernel is not False and sig_len >= n_fft:
             # --- Metal path: fused frame extraction + Metal backward ---
             pad = n_fft // 2
             padded_len = sig_len + 2 * pad
@@ -2259,8 +2330,13 @@ class SpectralTransform:
         else:
             # --- Pure MLX fallback path ---
             if center:
-                pad = self.n_fft // 2
-                x = _torch_like_reflect_pad_1d_compiled(x, pad)
+                x = _apply_center_padding(
+                    x,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    center_pad_mode=center_pad_mode,
+                    center_tail_pad=center_tail_pad,
+                )
 
             B, T_pad = x.shape
             if T_pad < n_fft:
@@ -2320,7 +2396,12 @@ class SpectralTransform:
         window = self.window
         window_sq = self._window_sq
         center = self.center
+        center_tail_pad = self.center_tail_pad
         length_int = int(length) if length is not None else None
+        if center and center_tail_pad == "minimal" and length_int is None:
+            raise ValueError(
+                "length is required when center_tail_pad='minimal' for differentiable_istft"
+            )
 
         B, n_frames, freq_bins = z.shape
         n_frames_int = int(n_frames)
@@ -2565,7 +2646,12 @@ class SpectralTransform:
         #            ~1.3× faster when bandwidth-bound (large B × sig_len).
         #   Simple — one thread per output element, no shared memory.
         #            Used for small workloads where dispatch latency dominates.
-        if self.center and sig_len >= self.n_fft:
+        use_reflect_fast_path = (
+            self.center
+            and self.center_pad_mode == "reflect"
+            and self.center_tail_pad == "symmetric"
+        )
+        if use_reflect_fast_path and sig_len >= self.n_fft:
             pad = self.n_fft // 2
             padded_len = sig_len + 2 * pad
             n_frames = (padded_len - self.n_fft) // self.hop_length + 1
@@ -2633,8 +2719,13 @@ class SpectralTransform:
         x = mx.contiguous(x)
 
         if self.center:
-            pad = self.n_fft // 2
-            x = _torch_like_reflect_pad_1d_compiled(x, pad)
+            x = _apply_center_padding(
+                x,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                center_pad_mode=self.center_pad_mode,
+                center_tail_pad=self.center_tail_pad,
+            )
 
         B, T_pad = x.shape
         if T_pad < self.n_fft:
@@ -2748,9 +2839,13 @@ class SpectralTransform:
                 )
             z_bnf = z
 
-        trimmed_length = self.hop_length * (int(n_frames) - 1) if self.center else (
-            self.hop_length * (int(n_frames) - 1) + self.n_fft
-        )
+        if self.center:
+            if self.center_tail_pad == "minimal":
+                trimmed_length = self.hop_length * int(n_frames)
+            else:
+                trimmed_length = self.hop_length * (int(n_frames) - 1)
+        else:
+            trimmed_length = self.hop_length * (int(n_frames) - 1) + self.n_fft
         is_long_request = (length is not None) and (int(length) > int(trimmed_length))
 
         if resolved_backend == "torch_fallback":
@@ -2770,6 +2865,7 @@ class SpectralTransform:
             (resolved_backend == "auto")
             and
             bool(self.center)
+            and (self.center_tail_pad == "symmetric")
             and bool(is_long_request)
             and (long_mode_strategy == "torch_fallback")
             and (int(self.hop_length) * 2 == int(self.n_fft))
@@ -2879,6 +2975,10 @@ class SpectralTransform:
             else:
                 out = out_legacy
         # Trimming / Torch-like length handling
+        if self.center and self.center_tail_pad == "minimal" and length is None:
+            raise ValueError(
+                "length is required when center_tail_pad='minimal' for istft"
+            )
         if self.center:
             pad = self.n_fft // 2
             if length is None:
@@ -2907,6 +3007,9 @@ class SpectralTransform:
         self, z_bfn: mx.array, *, length: Optional[int],
     ) -> Optional[mx.array]:
         """Run torch.istft for strict parity in selected long-mode cases."""
+        if self.center and self.center_tail_pad != "symmetric":
+            _record_cache_event("backend.torch_fallback.unsupported_center_tail_pad")
+            return None
         try:
             import torch
         except Exception as err:
@@ -3018,6 +3121,8 @@ class MelSpectrogramTransform:
         window_fn: str = "hann",
         periodic: bool = True,
         center: bool = True,
+        center_pad_mode: CenterPadMode = "reflect",
+        center_tail_pad: CenterTailPad = "symmetric",
         normalized: bool = False,
     ) -> None:
         self.sample_rate = int(sample_rate)
@@ -3047,6 +3152,8 @@ class MelSpectrogramTransform:
             window_fn=window_fn,
             periodic=periodic,
             center=center,
+            center_pad_mode=center_pad_mode,
+            center_tail_pad=center_tail_pad,
             normalized=normalized,
         )
         self.mel_fb = melscale_fbanks(
@@ -3131,6 +3238,8 @@ def onset_strength_multi(
     norm: MelNorm = "slaney",
     mel_scale: MelScale = "slaney",
     top_db: Optional[float] = 80.0,
+    center_pad_mode: CenterPadMode = "reflect",
+    center_tail_pad: CenterTailPad = "symmetric",
 ) -> mx.array:
     """Per-band half-wave rectified spectral flux of a dB-scaled mel spectrogram.
 
@@ -3165,6 +3274,8 @@ def onset_strength_multi(
         window_fn="hann",
         periodic=True,
         center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
     )
 
     # [B, n_mels, frames]
@@ -3202,6 +3313,8 @@ def onset_strength(
     norm: MelNorm = "slaney",
     mel_scale: MelScale = "slaney",
     top_db: Optional[float] = 80.0,
+    center_pad_mode: CenterPadMode = "reflect",
+    center_tail_pad: CenterTailPad = "symmetric",
 ) -> mx.array:
     """Half-wave rectified spectral flux of a dB-scaled mel spectrogram.
 
@@ -3223,6 +3336,8 @@ def onset_strength(
         norm=norm,
         mel_scale=mel_scale,
         top_db=top_db,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
     )
     return mx.mean(multi, axis=-2)
 
@@ -3240,6 +3355,8 @@ def _get_transform_cached(key: _TransformKey) -> SpectralTransform:
         window_fn=key.window_fn,
         periodic=key.periodic,
         center=key.center,
+        center_pad_mode=key.center_pad_mode,
+        center_tail_pad=key.center_tail_pad,
         normalized=key.normalized,
         istft_backend_policy=key.istft_backend_policy,
     )
@@ -3254,6 +3371,8 @@ def get_transform_mlx(
     center: bool,
     normalized: bool,
     window: WindowLike,
+    center_pad_mode: CenterPadMode = "reflect",
+    center_tail_pad: CenterTailPad = "symmetric",
     istft_backend_policy: Optional[str] = None,
 ) -> SpectralTransform:
     """Return a cached or bespoke SpectralTransform for the given config."""
@@ -3270,6 +3389,8 @@ def get_transform_mlx(
             window=window,
             periodic=periodic,
             center=center,
+            center_pad_mode=center_pad_mode,
+            center_tail_pad=center_tail_pad,
             normalized=normalized,
             istft_backend_policy=resolved_backend,
         )
@@ -3281,6 +3402,8 @@ def get_transform_mlx(
         window_fn=str(window_fn),
         periodic=bool(periodic),
         center=bool(center),
+        center_pad_mode=str(center_pad_mode),
+        center_tail_pad=str(center_tail_pad),
         normalized=bool(normalized),
         istft_backend_policy=str(resolved_backend),
     )
