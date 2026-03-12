@@ -25,6 +25,39 @@ mel = MelSpectrogramTransform(
 mel_db = mel(audio)  # [B, n_mels, frames]
 ```
 
+```python
+from mlx_spectro import LogMelSpectrogramTransform
+
+log_mel = LogMelSpectrogramTransform(
+    sample_rate=16000,
+    n_fft=2048,
+    hop_length=512,
+    n_mels=256,
+    f_min=30.0,
+    f_max=8000.0,
+    power=1.0,
+    norm="slaney",
+    mel_scale="htk",
+    center_pad_mode="constant",
+    log_amin=1e-5,
+    log_mode="clamp",
+)
+mel_log = log_mel(audio)  # [B, n_mels, frames]
+```
+
+```python
+from mlx_spectro import MFCCTransform
+
+mfcc_transform = MFCCTransform(
+    sample_rate=16000,
+    n_mfcc=13,
+    n_fft=400,
+    hop_length=160,
+    n_mels=40,
+)
+coeffs = mfcc_transform(audio)  # [B, n_mfcc, frames]
+```
+
 [mlx-audio-separator](https://github.com/ssmall256/mlx-audio-separator) uses mlx-spectro for MLX-native stem separation (Roformer, MDX, Demucs) and runs **1.8–3.1x faster end-to-end** than python-audio-separator on torch+MPS. See [benchmarks](#real-world-mlx-audio-separator) below.
 
 ## Install
@@ -89,9 +122,15 @@ SpectralTransform(
 
 **Methods:**
 - `stft(x, output_layout="bfn")` — Forward STFT. Input: `[T]` or `[B, T]`.
-- `istft(z, length=None, ...)` — Inverse STFT. Returns `[B, T]`.
+- `istft(z, length=None, validate=False, *, torch_like=False, allow_fused=True, safety="auto", long_mode_strategy="native", backend_policy=None, input_layout="bfn")` — Inverse STFT. Returns `[B, T]`.
 - `compiled_pair(length, layout="bnf", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
+- `prewarm_kernels(batch=1, length=None)` — Precompile eager STFT plus fused and legacy iSTFT kernels.
+- `prewarm_compiled(batch=1, length=None, ...)` — Precompile cached compiled STFT/iSTFT callables.
+- `get_compiled_stft(output_layout="bfn")` / `stft_compiled(x, output_layout="bfn")` — Cached `mx.compile` STFT helpers for fixed-shape loops.
+- `get_compiled_istft(...)` / `istft_compiled(z, ...)` — Cached `mx.compile` iSTFT helpers for fixed-shape loops.
+- `differentiable_stft(x)` — STFT entry point intended for `mx.grad` / `mx.value_and_grad`, returns `[B, N, F]`.
+- `differentiable_istft(z, length=None)` — iSTFT entry point intended for gradients, expects `[B, N, F]`.
 
 **Centering and padding semantics:**
 - `center=True, center_pad_mode="reflect", center_tail_pad="symmetric"`: default PyTorch-style centered STFT with reflect padding on both sides. This keeps the current fused Metal fast path.
@@ -99,6 +138,11 @@ SpectralTransform(
 - `center=True, center_pad_mode="constant", center_tail_pad="minimal"`: centered STFT with zero left padding and only the minimal right padding needed to keep frame count at `ceil(len / hop_length)`. This is useful for madmom-style frontends that should not emit an extra tail frame.
 
 `center_pad_mode="reflect"` currently requires `center_tail_pad="symmetric"`. When using `center_tail_pad="minimal"`, `istft(..., length=...)` must be given an explicit `length`.
+
+**Choosing an interface:**
+- Use `stft()` / `istft()` for standard inference and variable-shape inputs.
+- Use `compiled_pair()` or the `*_compiled()` helpers when shapes are fixed and you want lower dispatch overhead.
+- Use `differentiable_stft()` / `differentiable_istft()` when gradients must flow through the transform.
 
 ### Padding Examples
 
@@ -154,19 +198,73 @@ MelSpectrogramTransform(
     norm: str | None = None,      # None or "slaney"
     mel_scale: str = "htk",       # "htk" or "slaney"
     top_db: float | None = 80.0,
+    output_scale: str = "db",     # "linear", "log", or "db"
+    log_amin: float = 1e-5,
+    log_mode: str = "clamp",      # "clamp" or "add"
     mode: str = "mlx_native",     # "mlx_native" or "torchaudio_compat"; "default" alias -> "mlx_native"
+    window_fn: str = "hann",
+    periodic: bool = True,
+    center: bool = True,
     center_pad_mode: str = "reflect",
     center_tail_pad: str = "symmetric",
+    normalized: bool = False,
 )
 ```
 
 **Methods:**
-- `spectrogram(x)` — Returns power spectrogram `[B, F, N]`.
-- `mel_spectrogram(x, to_db=True)` / `__call__(x, to_db=True)` — Returns `[B, n_mels, N]`.
+- `spectrogram(x)` — Returns power or magnitude spectrogram `[B, F, N]`.
+- `mel_spectrogram(x, output_scale=None, to_db=None)` / `__call__(x, output_scale=None, to_db=None)` — Returns `[B, n_mels, N]`.
 
 **Mode semantics:**
 - `mode="mlx_native"`: per-example `top_db` clipping (batch-independent behavior).
 - `mode="torchaudio_compat"`: torchaudio-compatible packed-batch clipping semantics for parity-sensitive pipelines.
+
+**Output scale semantics:**
+- `output_scale="linear"`: return linear mel values.
+- `output_scale="log"`: return natural-log mel using `log_mode` and `log_amin`.
+- `output_scale="db"`: return dB mel; this preserves the current default behavior.
+- `to_db=True` and `to_db=False` remain supported as compatibility aliases for `output_scale="db"` and `output_scale="linear"`.
+
+### `LogMelSpectrogramTransform`
+
+Convenience wrapper for natural-log mel frontends. It is equivalent to `MelSpectrogramTransform(..., output_scale="log", ...)` and is intended for AMT/ASR-style pipelines that want log-mel directly instead of dB output.
+
+### Feature Extraction
+
+### `MFCCTransform`
+
+MFCC frontend built on top of `MelSpectrogramTransform`.
+
+```python
+MFCCTransform(
+    sample_rate: int = 22050,
+    n_mfcc: int = 20,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+    norm: str | None = "slaney",
+    mel_scale: str = "slaney",
+    top_db: float | None = 80.0,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    lifter: int = 0,
+    dct_norm: str | None = "ortho",
+)
+```
+
+**Methods:**
+- `mfcc(x)` / `__call__(x)` — Returns MFCCs `[n_mfcc, frames]` for 1-D input or `[B, n_mfcc, frames]` for batched input.
+
+MFCC uses librosa-style mel defaults (`norm="slaney"`, `mel_scale="slaney"`) while reusing this package's explicit STFT padding controls.
+
+### `mfcc(x, *, sample_rate=22050, n_mfcc=20, n_fft=2048, hop_length=512, ..., lifter=0, dct_norm="ortho")`
+
+Functional MFCC helper with the same parameters as `MFCCTransform`, intended for one-off extraction. Returns `[n_mfcc, frames]` for 1-D input or `[B, n_mfcc, frames]` for batched input.
 
 ### `onset_strength(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ..., center_pad_mode="reflect", center_tail_pad="symmetric")`
 
@@ -176,9 +274,69 @@ Half-wave rectified spectral flux of a dB-scaled mel spectrogram, matching libro
 
 Per-band half-wave rectified spectral flux (before averaging across frequency). Returns `[n_mels, frames]` for 1-D input or `[B, n_mels, frames]` for batched input.
 
+### `chroma_stft(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, n_chroma=12, norm=2, ..., tuning=0.0)`
+
+STFT chromagram using a librosa-style chroma filterbank. Returns `[n_chroma, frames]` for 1-D input or `[B, n_chroma, frames]` for batched input.
+
+### `spectral_features(x, *, include=None, sample_rate=22050, n_fft=2048, hop_length=512, ..., n_mfcc=20, n_mels=128)`
+
+Shared-STFT bundle API for extracting any combination of `chroma_stft`, `spectral_centroid`, `spectral_bandwidth`, `spectral_rolloff`, `spectral_contrast`, and `mfcc` from one magnitude pass. Returns an ordered mapping keyed by the requested function names, which is useful when you need several STFT-derived descriptors together. `rms` and `zero_crossing_rate` stay separate because they operate directly on framed waveform samples.
+
+### `SpectralFeatureTransform(*, include=None, sample_rate=22050, n_fft=2048, hop_length=512, ..., n_mfcc=20, n_mels=128)`
+
+Cached reusable version of `spectral_features(...)` for repeated-call workloads. It keeps one STFT transform plus any needed chroma filterbanks, mel filterbanks, DCT matrices, and MFCC lifter weights alive across calls, so it is the intended hot-path API when you repeatedly extract the same descriptor set with fixed parameters.
+
+**Methods:**
+- `extract(x)` / `__call__(x)` — Returns the same ordered mapping as `spectral_features(...)`, but reuses cached frontend state.
+
+### `spectral_centroid(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, ...)`
+
+Per-frame weighted mean frequency. Returns `[1, frames]` for 1-D input or `[B, 1, frames]` for batched input.
+
+### `spectral_bandwidth(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, p=2.0, ...)`
+
+Per-frame spectral spread around the centroid. Returns `[1, frames]` for 1-D input or `[B, 1, frames]` for batched input.
+
+### `spectral_rolloff(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, roll_percent=0.85, ...)`
+
+Frequency below which `roll_percent` of spectral magnitude is contained. Returns `[1, frames]` for 1-D input or `[B, 1, frames]` for batched input.
+
+### `spectral_contrast(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, n_bands=6, fmin=200.0, quantile=0.02, ...)`
+
+Peak-to-valley contrast in octave-spaced subbands. Returns `[n_bands + 1, frames]` for 1-D input or `[B, n_bands + 1, frames]` for batched input.
+
+### `rms(x, *, frame_length=2048, hop_length=512, center=True, pad_mode="reflect")`
+
+Frame-wise root-mean-square energy computed directly from the waveform. Returns `[1, frames]` for 1-D input or `[B, 1, frames]` for batched input.
+
+### `zero_crossing_rate(x, *, frame_length=2048, hop_length=512, center=True, pad_mode="reflect")`
+
+Frame-wise fraction of sign changes computed directly from the waveform. Returns `[1, frames]` for 1-D input or `[B, 1, frames]` for batched input.
+
 ### `get_transform_mlx(**kwargs)`
 
-Factory that returns cached `SpectralTransform` instances for repeated use.
+Factory that returns cached `SpectralTransform` instances for repeated use when
+the window is specified symbolically.
+
+```python
+get_transform_mlx(
+    *,
+    n_fft: int,
+    hop_length: int,
+    win_length: int,
+    window_fn: str,
+    periodic: bool,
+    center: bool,
+    normalized: bool,
+    window: mx.array | None,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    istft_backend_policy: str | None = None,
+) -> SpectralTransform
+```
+
+If `window` is a concrete MLX array, a bespoke transform is returned instead of
+using the shared cache.
 
 ### `make_window(window, window_fn, win_length, n_fft, periodic)`
 
@@ -187,6 +345,33 @@ Create or validate a 1D analysis window.
 ### `resolve_fft_params(n_fft, hop_length, win_length, pad)`
 
 Resolve effective FFT parameters with PyTorch-compatible defaults.
+
+### `melscale_fbanks(n_freqs, f_min, f_max, n_mels, sample_rate, *, norm=None, mel_scale="htk")`
+
+Create torchaudio-compatible triangular mel filter banks. Returns
+`[n_freqs, n_mels]`, so mel projection is `spec @ fb`.
+
+### `dct_matrix(n_mfcc, n_mels, *, norm="ortho")`
+
+Create a DCT type-II basis matrix with shape `[n_mfcc, n_mels]` for MFCC extraction. Supports `norm=None` and `norm="ortho"`.
+
+### `amplitude_to_db(x, *, stype="power", top_db=80.0, amin=1e-10, ref_value=1.0, mode="torchaudio_compat")`
+
+Convert magnitude or power spectrograms to dB. `mode="torchaudio_compat"`
+matches torchaudio's packed-batch clipping behavior, while
+`mode="per_example"` clips each example independently.
+
+### Cache and Diagnostics
+
+- `get_cache_debug_stats(reset=False)` — Return cache counters and lightweight kernel/transform cache snapshots.
+- `reset_cache_debug_stats()` — Clear cache/debug counters.
+- `spec_mlx_device_key()` — Return the device identifier used for autotune-cache keys.
+
+### Typing Aliases
+
+The package also exports string-literal typing aliases for option-bearing APIs:
+`ISTFTBackendPolicy`, `STFTOutputLayout`, `CenterPadMode`,
+`CenterTailPad`, `MelScale`, `MelNorm`, `MelMode`, and `WindowLike`.
 
 ## Benchmarks
 
@@ -233,6 +418,7 @@ Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
 To reproduce:
 - Full suite: `python scripts/benchmark.py`
 - Dispatch overhead profile: `python scripts/benchmark.py --dispatch-profile`
+- Feature extraction bundle benchmarks: `python scripts/benchmark_features.py`
 
 ### Real-world: mlx-audio-separator
 

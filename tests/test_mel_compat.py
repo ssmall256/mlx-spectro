@@ -2,7 +2,12 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_spectro import MelSpectrogramTransform, amplitude_to_db, melscale_fbanks
+from mlx_spectro import (
+    LogMelSpectrogramTransform,
+    MelSpectrogramTransform,
+    amplitude_to_db,
+    melscale_fbanks,
+)
 
 
 def _to_numpy(x: mx.array) -> np.ndarray:
@@ -179,6 +184,146 @@ def test_mel_spectrogram_torchaudio_compat_matches_reference():
 
     assert ours.shape == ref.shape
     # STFT kernels are different implementations; keep a tight but practical tolerance.
+    np.testing.assert_allclose(ours, ref, rtol=2e-3, atol=2e-2)
+
+
+def test_log_mel_clamp_matches_linear_postprocess():
+    rng = np.random.default_rng(5)
+    audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
+    transform = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        output_scale="log",
+        log_amin=1e-5,
+        log_mode="clamp",
+    )
+    audio = mx.array(audio_np)
+    linear = _to_numpy(transform(audio, output_scale="linear"))
+    logged = _to_numpy(transform(audio))
+    ref = np.log(np.maximum(linear, 1e-5))
+    np.testing.assert_allclose(logged, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_log_mel_add_matches_linear_postprocess():
+    rng = np.random.default_rng(17)
+    audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
+    transform = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        output_scale="log",
+        log_amin=1e-5,
+        log_mode="add",
+    )
+    audio = mx.array(audio_np)
+    linear = _to_numpy(transform(audio, output_scale="linear"))
+    logged = _to_numpy(transform(audio))
+    ref = np.log(linear + 1e-5)
+    np.testing.assert_allclose(logged, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_log_mel_helper_matches_explicit_transform():
+    rng = np.random.default_rng(31)
+    audio_np = rng.standard_normal((1, 12_000), dtype=np.float32) * 0.2
+    helper = LogMelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        log_amin=1e-5,
+        log_mode="clamp",
+    )
+    explicit = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        output_scale="log",
+        log_amin=1e-5,
+        log_mode="clamp",
+    )
+    audio = mx.array(audio_np)
+    np.testing.assert_allclose(_to_numpy(helper(audio)), _to_numpy(explicit(audio)), rtol=1e-6, atol=1e-6)
+
+
+def test_mamba_amt_log_mel_matches_torchaudio_reference():
+    torch = pytest.importorskip("torch")
+    ta_t = pytest.importorskip("torchaudio.transforms")
+
+    rng = np.random.default_rng(41)
+    audio_np = rng.standard_normal((2, 16_000), dtype=np.float32) * 0.2
+
+    ours_tr = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        top_db=None,
+        output_scale="log",
+        log_amin=1e-5,
+        log_mode="clamp",
+        mode="torchaudio_compat",
+        center=True,
+        center_pad_mode="constant",
+        periodic=True,
+        normalized=False,
+    )
+    ours = _to_numpy(ours_tr(mx.array(audio_np)))
+
+    mel = ta_t.MelSpectrogram(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        win_length=2_048,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        normalized=False,
+        center=True,
+        pad_mode="constant",
+        norm="slaney",
+        mel_scale="htk",
+    )
+    ref = torch.log(torch.clamp(mel(torch.from_numpy(audio_np)), min=1e-5)).cpu().numpy().astype(np.float32)
+
+    assert ours.shape == ref.shape
     np.testing.assert_allclose(ours, ref, rtol=2e-3, atol=2e-2)
 
 

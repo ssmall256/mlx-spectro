@@ -1,9 +1,4 @@
-"""Reusable MLX spectral ops (STFT/iSTFT building blocks).
-
-Public surface is intentionally small and stable:
-`SpectralTransform`, `WindowLike`, `make_window`,
-`resolve_fft_params`, `get_transform_mlx`, and `spec_mlx_device_key`.
-"""
+"""Reusable MLX spectral ops for STFT, mel, and MFCC frontends."""
 
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
@@ -15,6 +10,9 @@ import mlx.core as mx
 __all__ = [
     "SpectralTransform",
     "MelSpectrogramTransform",
+    "LogMelSpectrogramTransform",
+    "MFCCTransform",
+    "SpectralFeatureTransform",
     "ISTFTBackendPolicy",
     "STFTOutputLayout",
     "CenterPadMode",
@@ -22,10 +20,22 @@ __all__ = [
     "MelScale",
     "MelNorm",
     "MelMode",
+    "MelOutputScale",
+    "LogMelMode",
     "WindowLike",
     "make_window",
     "melscale_fbanks",
     "amplitude_to_db",
+    "dct_matrix",
+    "mfcc",
+    "chroma_stft",
+    "spectral_features",
+    "spectral_centroid",
+    "spectral_bandwidth",
+    "spectral_rolloff",
+    "spectral_contrast",
+    "rms",
+    "zero_crossing_rate",
     "resolve_fft_params",
     "get_transform_mlx",
     "spec_mlx_device_key",
@@ -53,6 +63,8 @@ CenterTailPad = Literal["symmetric", "minimal"]
 MelScale = Literal["htk", "slaney"]
 MelNorm = Literal["slaney"] | None
 MelMode = Literal["mlx_native", "torchaudio_compat", "default"]
+MelOutputScale = Literal["linear", "log", "db"]
+LogMelMode = Literal["clamp", "add"]
 
 _CACHE_STATS_ENABLED = (
     os.environ.get("SPEC_MLX_CACHE_STATS", "0").lower()
@@ -1708,6 +1720,107 @@ def amplitude_to_db(
     return x_view.reshape(shape)
 
 
+def dct_matrix(
+    n_mfcc: int,
+    n_mels: int,
+    *,
+    norm: Literal["ortho"] | None = "ortho",
+) -> mx.array:
+    """Create a DCT type-II matrix ``[n_mfcc, n_mels]``."""
+    n_mfcc = int(n_mfcc)
+    n_mels = int(n_mels)
+    if n_mfcc <= 0:
+        raise ValueError("n_mfcc must be > 0")
+    if n_mels <= 0:
+        raise ValueError("n_mels must be > 0")
+    if n_mfcc > n_mels:
+        raise ValueError("n_mfcc must be <= n_mels")
+    if norm not in (None, "ortho"):
+        raise ValueError('norm must be one of {None, "ortho"}')
+
+    n = np.arange(float(n_mels), dtype=np.float64)
+    k = np.arange(float(n_mfcc), dtype=np.float64)[:, None]
+    dct = np.cos((math.pi / float(n_mels)) * (n + 0.5) * k).astype(np.float32)
+
+    if norm is None:
+        dct *= 2.0
+    else:
+        dct[0] *= 1.0 / math.sqrt(2.0)
+        dct *= math.sqrt(2.0 / float(n_mels))
+
+    return mx.array(dct, dtype=mx.float32)
+
+
+@lru_cache(maxsize=128)
+def _cached_mel_filterbank(
+    n_freqs: int,
+    f_min: float,
+    f_max: float,
+    n_mels: int,
+    sample_rate: int,
+    norm: MelNorm,
+    mel_scale: MelScale,
+) -> mx.array:
+    return melscale_fbanks(
+        n_freqs=int(n_freqs),
+        f_min=float(f_min),
+        f_max=float(f_max),
+        n_mels=int(n_mels),
+        sample_rate=int(sample_rate),
+        norm=norm,
+        mel_scale=mel_scale,
+    )
+
+
+@lru_cache(maxsize=128)
+def _cached_dct_matrix(
+    n_mfcc: int,
+    n_mels: int,
+    norm: Literal["ortho"] | None,
+) -> mx.array:
+    return dct_matrix(int(n_mfcc), int(n_mels), norm=norm)
+
+
+@lru_cache(maxsize=128)
+def _cached_lifter_weights(
+    n_mfcc: int,
+    lifter: int,
+) -> mx.array:
+    idx = mx.arange(1, int(n_mfcc) + 1, dtype=mx.float32)
+    return (
+        1.0 + (float(lifter) / 2.0) * mx.sin((math.pi / float(lifter)) * idx)
+    ).astype(mx.float32)
+
+
+def _apply_mel_filterbank(
+    power: mx.array,
+    *,
+    mel_fb: mx.array,
+    input_layout: Literal["bnf", "bfn"] = "bnf",
+) -> mx.array:
+    if input_layout == "bnf":
+        power_bnf = power
+    elif input_layout == "bfn":
+        power_bnf = mx.transpose(power, (0, 2, 1))
+    else:
+        raise ValueError('input_layout must be one of {"bnf", "bfn"}')
+    mel_bnm = mx.matmul(power_bnf, mel_fb)
+    return mx.transpose(mel_bnm, (0, 2, 1)).astype(mx.float32)
+
+
+def _apply_mfcc_projection(
+    mel_bmn: mx.array,
+    *,
+    dct_mat_t: mx.array,
+    lifter_weights: mx.array | None = None,
+) -> mx.array:
+    mfcc_bnm = mx.matmul(mx.transpose(mel_bmn, (0, 2, 1)), dct_mat_t)
+    mfcc_bmn = mx.transpose(mfcc_bnm, (0, 2, 1)).astype(mx.float32)
+    if lifter_weights is not None:
+        mfcc_bmn = mfcc_bmn * lifter_weights[None, :, None]
+    return mfcc_bmn
+
+
 _ISTFT_BACKEND_POLICIES = ("auto", "mlx_fft", "metal", "torch_fallback")
 _STFT_OUTPUT_LAYOUTS = ("bfn", "bnf")
 
@@ -3099,6 +3212,9 @@ class MelSpectrogramTransform:
         "mel_scale",
         "mode",
         "top_db",
+        "output_scale",
+        "log_amin",
+        "log_mode",
         "spectral",
         "mel_fb",
     )
@@ -3117,6 +3233,9 @@ class MelSpectrogramTransform:
         norm: MelNorm = None,
         mel_scale: MelScale = "htk",
         top_db: Optional[float] = 80.0,
+        output_scale: MelOutputScale = "db",
+        log_amin: float = 1e-5,
+        log_mode: LogMelMode = "clamp",
         mode: MelMode = "mlx_native",
         window_fn: str = "hann",
         periodic: bool = True,
@@ -3140,23 +3259,34 @@ class MelSpectrogramTransform:
             mode_name = "mlx_native"
         self.mode = mode_name
         self.top_db = top_db
+        self.output_scale = str(output_scale)
+        self.log_amin = float(log_amin)
+        self.log_mode = str(log_mode)
         if self.mode not in ("mlx_native", "torchaudio_compat"):
             raise ValueError('mode must be one of {"mlx_native", "torchaudio_compat", "default"}')
         if self.power <= 0:
             raise ValueError("power must be > 0")
+        if self.output_scale not in ("linear", "log", "db"):
+            raise ValueError('output_scale must be one of {"linear", "log", "db"}')
+        if self.log_mode not in ("clamp", "add"):
+            raise ValueError('log_mode must be one of {"clamp", "add"}')
+        if self.log_amin <= 0.0:
+            raise ValueError("log_amin must be > 0")
 
-        self.spectral = SpectralTransform(
+        self.spectral = get_transform_mlx(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
             window_fn=window_fn,
             periodic=periodic,
             center=center,
+            normalized=normalized,
+            window=None,
             center_pad_mode=center_pad_mode,
             center_tail_pad=center_tail_pad,
-            normalized=normalized,
+            istft_backend_policy=None,
         )
-        self.mel_fb = melscale_fbanks(
+        self.mel_fb = _cached_mel_filterbank(
             n_freqs=(self.n_fft // 2 + 1),
             f_min=self.f_min,
             f_max=self.f_max,
@@ -3203,20 +3333,1307 @@ class MelSpectrogramTransform:
         """Return power spectrogram in ``[B, F, N]`` layout."""
         return mx.transpose(self._power_spectrogram_bnf(x), (0, 2, 1))
 
-    def mel_spectrogram(self, x: mx.array, *, to_db: bool = True) -> mx.array:
-        """Compute mel spectrogram, returning ``[B, n_mels, frames]``."""
-        p_bnf = self._power_spectrogram_bnf(x)  # [B,N,F] — no redundant transposes
-        mel_bnm = mx.matmul(p_bnf, self.mel_fb)  # [B,N,M]
-        mel_bmn = mx.transpose(mel_bnm, (0, 2, 1)).astype(mx.float32)
-        if not to_db:
+    def _resolve_output_scale(
+        self,
+        *,
+        output_scale: MelOutputScale | None,
+        to_db: bool | None,
+    ) -> MelOutputScale:
+        if output_scale is not None and to_db is not None:
+            raise ValueError("output_scale and to_db cannot both be set")
+        if output_scale is not None:
+            resolved = str(output_scale)
+        elif to_db is not None:
+            resolved = "db" if to_db else "linear"
+        else:
+            resolved = self.output_scale
+        if resolved not in ("linear", "log", "db"):
+            raise ValueError('resolved output_scale must be one of {"linear", "log", "db"}')
+        return resolved
+
+    def _apply_output_scale(self, mel_bmn: mx.array, *, output_scale: MelOutputScale) -> mx.array:
+        if output_scale == "linear":
             return mel_bmn
+        if output_scale == "log":
+            amin = mx.array(self.log_amin, dtype=mx.float32)
+            if self.log_mode == "add":
+                return mx.log(mel_bmn + amin).astype(mx.float32)
+            return mx.log(mx.maximum(mel_bmn, amin)).astype(mx.float32)
         db_mode: Literal["torchaudio_compat", "per_example"] = (
             "torchaudio_compat" if self.mode == "torchaudio_compat" else "per_example"
         )
         return amplitude_to_db(mel_bmn, stype="power", top_db=self.top_db, mode=db_mode)
 
-    def __call__(self, x: mx.array, *, to_db: bool = True) -> mx.array:
-        return self.mel_spectrogram(x, to_db=to_db)
+    def mel_spectrogram(
+        self,
+        x: mx.array,
+        *,
+        output_scale: MelOutputScale | None = None,
+        to_db: bool | None = None,
+    ) -> mx.array:
+        """Compute mel spectrogram, returning ``[B, n_mels, frames]``."""
+        p_bnf = self._power_spectrogram_bnf(x)  # [B,N,F] — no redundant transposes
+        mel_bmn = _apply_mel_filterbank(p_bnf, mel_fb=self.mel_fb, input_layout="bnf")
+        resolved = self._resolve_output_scale(output_scale=output_scale, to_db=to_db)
+        return self._apply_output_scale(mel_bmn, output_scale=resolved)
+
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        output_scale: MelOutputScale | None = None,
+        to_db: bool | None = None,
+    ) -> mx.array:
+        return self.mel_spectrogram(x, output_scale=output_scale, to_db=to_db)
+
+
+class LogMelSpectrogramTransform(MelSpectrogramTransform):
+    """Convenience wrapper for natural-log mel frontends."""
+
+    def __init__(
+        self,
+        *,
+        log_amin: float = 1e-5,
+        log_mode: LogMelMode = "clamp",
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            output_scale="log",
+            log_amin=log_amin,
+            log_mode=log_mode,
+            **kwargs,
+        )
+
+
+class MFCCTransform:
+    """MFCC frontend built on top of :class:`MelSpectrogramTransform`."""
+
+    __slots__ = (
+        "sample_rate",
+        "n_mfcc",
+        "n_fft",
+        "hop_length",
+        "win_length",
+        "n_mels",
+        "f_min",
+        "f_max",
+        "norm",
+        "mel_scale",
+        "top_db",
+        "window_fn",
+        "center",
+        "center_pad_mode",
+        "center_tail_pad",
+        "lifter",
+        "dct_norm",
+        "mel_transform",
+        "dct_mat",
+        "_dct_mat_t",
+        "_lifter_weights",
+    )
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 22_050,
+        n_mfcc: int = 20,
+        n_fft: int = 2_048,
+        hop_length: int = 512,
+        win_length: Optional[int] = None,
+        n_mels: int = 128,
+        f_min: float = 0.0,
+        f_max: Optional[float] = None,
+        norm: MelNorm = "slaney",
+        mel_scale: MelScale = "slaney",
+        top_db: Optional[float] = 80.0,
+        window_fn: str = "hann",
+        center: bool = True,
+        center_pad_mode: CenterPadMode = "reflect",
+        center_tail_pad: CenterTailPad = "symmetric",
+        lifter: int = 0,
+        dct_norm: Literal["ortho"] | None = "ortho",
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.n_mfcc = int(n_mfcc)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.win_length = int(win_length) if win_length is not None else int(n_fft)
+        self.n_mels = int(n_mels)
+        self.f_min = float(f_min)
+        self.f_max = float(self.sample_rate // 2 if f_max is None else f_max)
+        self.norm = norm
+        self.mel_scale = mel_scale
+        self.top_db = top_db
+        self.window_fn = str(window_fn)
+        self.center = bool(center)
+        self.center_pad_mode = center_pad_mode
+        self.center_tail_pad = center_tail_pad
+        self.lifter = int(lifter)
+        self.dct_norm = dct_norm
+
+        if self.n_mfcc <= 0:
+            raise ValueError("n_mfcc must be > 0")
+        if self.n_mels <= 0:
+            raise ValueError("n_mels must be > 0")
+        if self.n_mfcc > self.n_mels:
+            raise ValueError("n_mfcc must be <= n_mels")
+        if self.lifter < 0:
+            raise ValueError("lifter must be >= 0")
+        if self.dct_norm not in (None, "ortho"):
+            raise ValueError('dct_norm must be one of {None, "ortho"}')
+
+        self.mel_transform = MelSpectrogramTransform(
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            n_mels=self.n_mels,
+            f_min=self.f_min,
+            f_max=self.f_max,
+            power=2.0,
+            norm=self.norm,
+            mel_scale=self.mel_scale,
+            top_db=self.top_db,
+            mode="mlx_native",
+            window_fn=self.window_fn,
+            periodic=True,
+            center=self.center,
+            center_pad_mode=self.center_pad_mode,
+            center_tail_pad=self.center_tail_pad,
+            normalized=False,
+        )
+        self.dct_mat = _cached_dct_matrix(self.n_mfcc, self.n_mels, self.dct_norm)
+        self._dct_mat_t = _cached_dct_matrix_t(self.n_mfcc, self.n_mels, self.dct_norm)
+        if self.lifter > 0:
+            self._lifter_weights = _cached_lifter_weights(self.n_mfcc, self.lifter)
+        else:
+            self._lifter_weights = None
+
+    def mfcc(self, x: mx.array) -> mx.array:
+        """Compute MFCCs, returning ``[B, n_mfcc, frames]`` or ``[n_mfcc, frames]``."""
+        squeezed = x.ndim == 1
+        if squeezed:
+            x = x[None, :]
+        elif x.ndim != 2:
+            raise ValueError(f"mfcc expects 1D or 2D input, got {x.shape}")
+
+        mel_bmn = self.mel_transform.mel_spectrogram(x, to_db=True)
+        mfcc_bmn = _apply_mfcc_projection(
+            mel_bmn,
+            dct_mat_t=self._dct_mat_t,
+            lifter_weights=self._lifter_weights,
+        )
+        if squeezed:
+            mfcc_bmn = mfcc_bmn.squeeze(0)
+        return mfcc_bmn
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.mfcc(x)
+
+
+def mfcc(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_mfcc: int = 20,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: Optional[int] = None,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: Optional[float] = None,
+    norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: Optional[float] = 80.0,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: CenterPadMode = "reflect",
+    center_tail_pad: CenterTailPad = "symmetric",
+    lifter: int = 0,
+    dct_norm: Literal["ortho"] | None = "ortho",
+) -> mx.array:
+    """Compute MFCCs from raw audio.
+
+    Returns ``[n_mfcc, frames]`` for 1-D input or ``[B, n_mfcc, frames]`` for
+    batched input.
+    """
+    transform = MFCCTransform(
+        sample_rate=sample_rate,
+        n_mfcc=n_mfcc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        n_mels=n_mels,
+        f_min=f_min,
+        f_max=f_max,
+        norm=norm,
+        mel_scale=mel_scale,
+        top_db=top_db,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        lifter=lifter,
+        dct_norm=dct_norm,
+    )
+    return transform(x)
+
+
+# ==============================================================================
+# Spectral Feature Descriptors
+# ==============================================================================
+
+_SPECTRAL_FEATURE_NAMES = (
+    "chroma_stft",
+    "spectral_centroid",
+    "spectral_bandwidth",
+    "spectral_rolloff",
+    "spectral_contrast",
+    "mfcc",
+)
+
+
+@lru_cache(maxsize=128)
+def _cached_chroma_filterbank(
+    sample_rate: int,
+    n_fft: int,
+    n_chroma: int,
+    tuning: float,
+) -> mx.array:
+    return _chroma_filterbank(
+        sample_rate=int(sample_rate),
+        n_fft=int(n_fft),
+        n_chroma=int(n_chroma),
+        tuning=float(tuning),
+    )
+
+
+def _ensure_audio_batch(x: mx.array, *, fn_name: str) -> tuple[mx.array, bool]:
+    if x.ndim == 1:
+        return x[None, :], True
+    if x.ndim != 2:
+        raise ValueError(f"{fn_name} expects 1D or 2D input, got {x.shape}")
+    return x, False
+
+
+def _restore_feature_batch(x: mx.array, *, squeezed: bool) -> mx.array:
+    return x[0] if squeezed else x
+
+
+def _fft_frequencies(sample_rate: int, n_fft: int) -> mx.array:
+    sample_rate = int(sample_rate)
+    n_fft = int(n_fft)
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be > 0")
+    if n_fft <= 0:
+        raise ValueError("n_fft must be > 0")
+    freqs = np.fft.rfftfreq(n=n_fft, d=1.0 / float(sample_rate)).astype(np.float32)
+    return mx.array(freqs, dtype=mx.float32)
+
+
+@lru_cache(maxsize=128)
+def _cached_fft_frequencies(sample_rate: int, n_fft: int) -> mx.array:
+    return _fft_frequencies(int(sample_rate), int(n_fft))
+
+
+@lru_cache(maxsize=128)
+def _cached_dct_matrix_t(
+    n_mfcc: int,
+    n_mels: int,
+    norm: Literal["ortho"] | None,
+) -> mx.array:
+    return mx.transpose(_cached_dct_matrix(int(n_mfcc), int(n_mels), norm), (1, 0))
+
+
+def _pad_waveform(
+    x: mx.array,
+    *,
+    pad: int,
+    mode: str,
+) -> mx.array:
+    if pad <= 0:
+        return x
+    if mode == "reflect":
+        if int(x.shape[1]) <= pad:
+            return mx.pad(x, [(0, 0), (pad, pad)], mode="edge")
+        return _torch_like_reflect_pad_1d(x, pad)
+    return mx.pad(x, [(0, 0), (pad, pad)], mode=mode)
+
+
+def _frame_signal(
+    x: mx.array,
+    *,
+    frame_length: int,
+    hop_length: int,
+    center: bool,
+    pad_mode: str,
+) -> tuple[mx.array, bool]:
+    x, squeezed = _ensure_audio_batch(x, fn_name="frame_signal")
+    frame_length = int(frame_length)
+    hop_length = int(hop_length)
+    if frame_length <= 0:
+        raise ValueError("frame_length must be > 0")
+    if hop_length <= 0:
+        raise ValueError("hop_length must be > 0")
+
+    x = mx.contiguous(x)
+    if center:
+        x = _pad_waveform(
+            x,
+            pad=frame_length // 2,
+            mode=str(pad_mode),
+        )
+
+    batch, length = x.shape
+    if length < frame_length:
+        x = mx.pad(x, [(0, 0), (0, frame_length - int(length))], mode="constant")
+        length = int(x.shape[1])
+
+    n_frames = 1 + (int(length) - frame_length) // hop_length
+    frames = mx.as_strided(
+        x,
+        shape=(int(batch), int(n_frames), frame_length),
+        strides=(int(length), hop_length, 1),
+    )
+    return mx.contiguous(frames), squeezed
+
+
+def _stft_magnitude(
+    x: mx.array,
+    *,
+    sample_rate: int,
+    n_fft: int,
+    hop_length: int,
+    win_length: Optional[int],
+    window_fn: str,
+    center: bool,
+    center_pad_mode: CenterPadMode,
+    center_tail_pad: CenterTailPad,
+) -> tuple[mx.array, bool]:
+    x, squeezed = _ensure_audio_batch(x, fn_name="stft_magnitude")
+    effective_center_pad_mode = center_pad_mode
+    n_fft = int(n_fft)
+    hop_length = int(hop_length)
+    win_length = int(win_length) if win_length is not None else int(n_fft)
+    if (
+        center
+        and center_pad_mode == "reflect"
+        and int(x.shape[1]) <= (n_fft // 2)
+    ):
+        effective_center_pad_mode = "constant"
+    tr = get_transform_mlx(
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=str(window_fn),
+        periodic=True,
+        center=bool(center),
+        normalized=False,
+        window=None,
+        center_pad_mode=effective_center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        istft_backend_policy=None,
+    )
+    spec = tr.stft(x, output_layout="bfn")
+    mag = mx.abs(spec).astype(mx.float32)
+    return mag, squeezed
+
+
+def _normalize(
+    x: mx.array,
+    *,
+    norm: float | None,
+    axis: int,
+) -> mx.array:
+    if norm is None:
+        return x
+    value = float(norm)
+    abs_x = mx.abs(x)
+    if math.isinf(value):
+        if value > 0:
+            denom = mx.max(abs_x, axis=axis, keepdims=True)
+        else:
+            denom = mx.min(abs_x, axis=axis, keepdims=True)
+    else:
+        if value <= 0:
+            raise ValueError("norm must be positive, +/-inf, or None")
+        denom = mx.sum(abs_x ** value, axis=axis, keepdims=True) ** (1.0 / value)
+    return x / mx.maximum(denom, 1e-10)
+
+
+def _chroma_filterbank(
+    sample_rate: int,
+    n_fft: int,
+    *,
+    n_chroma: int = 12,
+    tuning: float = 0.0,
+) -> mx.array:
+    sample_rate = int(sample_rate)
+    n_fft = int(n_fft)
+    n_chroma = int(n_chroma)
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be > 0")
+    if n_fft <= 0:
+        raise ValueError("n_fft must be > 0")
+    if n_chroma <= 0:
+        raise ValueError("n_chroma must be > 0")
+
+    frequencies = np.linspace(0.0, float(sample_rate), int(n_fft), endpoint=False)[1:]
+    A440 = 440.0 * (2.0 ** (float(tuning) / float(n_chroma)))
+    frqbins = float(n_chroma) * np.log2(frequencies / (A440 / 16.0))
+    frqbins = np.concatenate(([frqbins[0] - 1.5 * float(n_chroma)], frqbins))
+    binwidthbins = np.concatenate((np.maximum(frqbins[1:] - frqbins[:-1], 1.0), [1.0]))
+
+    D = np.subtract.outer(frqbins, np.arange(0, n_chroma, dtype=np.float64)).T
+    n_chroma2 = np.round(float(n_chroma) / 2.0)
+    D = np.remainder(D + n_chroma2 + 10.0 * float(n_chroma), float(n_chroma)) - n_chroma2
+
+    wts = np.exp(-0.5 * (2.0 * D / np.tile(binwidthbins, (n_chroma, 1))) ** 2)
+    norms = np.sqrt(np.sum(wts * wts, axis=0, keepdims=True))
+    wts = wts / np.maximum(norms, 1e-16)
+    wts *= np.tile(
+        np.exp(-0.5 * (((frqbins / float(n_chroma) - 5.0) / 2.0) ** 2)),
+        (n_chroma, 1),
+    )
+    wts = np.roll(wts, -3 * (n_chroma // 12), axis=0)
+    wts = np.ascontiguousarray(wts[:, : int(1 + n_fft / 2)], dtype=np.float32)
+    return mx.array(wts, dtype=mx.float32)
+
+
+def _normalize_spectral_feature_names(
+    include: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    if include is None:
+        return _SPECTRAL_FEATURE_NAMES
+    names: list[str] = []
+    for raw_name in include:
+        name = str(raw_name)
+        if name not in _SPECTRAL_FEATURE_NAMES:
+            valid = ", ".join(_SPECTRAL_FEATURE_NAMES)
+            raise ValueError(f"Unknown spectral feature {name!r}. Expected one of: {valid}")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("include must request at least one spectral feature")
+    return tuple(names)
+
+
+def _spectral_centroid_from_mag(
+    mag: mx.array,
+    *,
+    freqs: mx.array,
+) -> mx.array:
+    denom = mx.maximum(mx.sum(mag, axis=1, keepdims=True), 1e-10)
+    return (mx.sum(mag * freqs[None, :, None], axis=1, keepdims=True) / denom).astype(mx.float32)
+
+
+def _spectral_bandwidth_from_mag(
+    mag: mx.array,
+    *,
+    freqs: mx.array,
+    p: float,
+    centroid: mx.array | None = None,
+) -> mx.array:
+    p = float(p)
+    if p <= 0:
+        raise ValueError("p must be > 0")
+    if centroid is None:
+        centroid = _spectral_centroid_from_mag(mag, freqs=freqs)
+    denom = mx.maximum(mx.sum(mag, axis=1, keepdims=True), 1e-10)
+    deviation = mx.abs(freqs[None, :, None] - centroid) ** p
+    return ((mx.sum(mag * deviation, axis=1, keepdims=True) / denom) ** (1.0 / p)).astype(mx.float32)
+
+
+def _spectral_rolloff_from_mag(
+    mag: mx.array,
+    *,
+    freqs: mx.array,
+    roll_percent: float,
+) -> mx.array:
+    roll_percent = float(roll_percent)
+    if not 0.0 < roll_percent < 1.0:
+        raise ValueError("roll_percent must lie in the range (0, 1)")
+    total_energy = mx.cumsum(mag, axis=1)
+    threshold = roll_percent * total_energy[:, -1:, :]
+    idx = mx.argmax((total_energy >= threshold).astype(mx.int32), axis=1)
+    roll = mx.take(freqs, idx.reshape(-1)).reshape(idx.shape)
+    return roll[:, None, :].astype(mx.float32)
+
+
+def _spectral_contrast_from_mag(
+    mag: mx.array,
+    *,
+    sample_rate: int,
+    n_fft: int,
+    n_bands: int,
+    fmin: float,
+    quantile: float,
+) -> mx.array:
+    if int(n_bands) < 1:
+        raise ValueError("n_bands must be a positive integer")
+    if not 0.0 < float(quantile) < 1.0:
+        raise ValueError("quantile must lie in the range (0, 1)")
+    if float(fmin) <= 0.0:
+        raise ValueError("fmin must be a positive number")
+
+    freq_np = np.asarray(_cached_fft_frequencies(sample_rate, n_fft), dtype=np.float32)
+    octa = np.zeros(int(n_bands) + 2, dtype=np.float32)
+    octa[1:] = float(fmin) * (2.0 ** np.arange(0, int(n_bands) + 1))
+    if np.any(octa[:-1] >= 0.5 * float(sample_rate)):
+        raise ValueError("Frequency band exceeds Nyquist. Reduce either fmin or n_bands.")
+
+    valleys = []
+    peaks = []
+    for k, (f_low, f_high) in enumerate(zip(octa[:-1], octa[1:])):
+        start = int(np.searchsorted(freq_np, f_low, side="left"))
+        end = int(np.searchsorted(freq_np, f_high, side="right"))
+        if end <= start:
+            end = min(start + 1, freq_np.shape[0])
+        if k > 0:
+            start = max(start - 1, 0)
+        if k == int(n_bands):
+            end = freq_np.shape[0]
+        elif end - start > 1:
+            end -= 1
+        sub_band = mag[:, start:end, :]
+        band_bins = int(sub_band.shape[1])
+        idx = max(int(np.rint(float(quantile) * band_bins)), 1)
+        sorted_band = mx.sort(sub_band, axis=1)
+        valleys.append(mx.mean(sorted_band[:, :idx, :], axis=1))
+        peaks.append(mx.mean(sorted_band[:, -idx:, :], axis=1))
+
+    valley = mx.stack(valleys, axis=1).astype(mx.float32)
+    peak = mx.stack(peaks, axis=1).astype(mx.float32)
+    return (
+        amplitude_to_db(peak, stype="power", top_db=None)
+        - amplitude_to_db(valley, stype="power", top_db=None)
+    ).astype(mx.float32)
+
+
+def _chroma_stft_from_power(
+    power: mx.array,
+    *,
+    chroma_fb: mx.array,
+    norm: float | None,
+) -> mx.array:
+    chroma_bnc = mx.matmul(mx.transpose(power, (0, 2, 1)), mx.transpose(chroma_fb, (1, 0)))
+    chroma_bcn = mx.transpose(chroma_bnc, (0, 2, 1)).astype(mx.float32)
+    return _normalize(chroma_bcn, norm=norm, axis=-2)
+
+
+def _mfcc_from_power(
+    power: mx.array,
+    *,
+    mel_fb: mx.array,
+    dct_mat_t: mx.array,
+    top_db: float | None = 80.0,
+    lifter_weights: mx.array | None = None,
+) -> mx.array:
+    mel_bmn = _apply_mel_filterbank(power, mel_fb=mel_fb, input_layout="bfn")
+    mel_bmn = amplitude_to_db(mel_bmn, stype="power", top_db=top_db, mode="per_example")
+    return _apply_mfcc_projection(
+        mel_bmn,
+        dct_mat_t=dct_mat_t,
+        lifter_weights=lifter_weights,
+    )
+
+
+def _spectral_feature_values_from_mag(
+    mag: mx.array,
+    *,
+    include: tuple[str, ...],
+    sample_rate: int,
+    n_fft: int,
+    n_chroma: int = 12,
+    chroma_norm: float | None = 2,
+    tuning: float = 0.0,
+    bandwidth_p: float = 2.0,
+    roll_percent: float = 0.85,
+    n_bands: int = 6,
+    contrast_fmin: float = 200.0,
+    contrast_quantile: float = 0.02,
+    n_mfcc: int = 20,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+    mel_norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: float | None = 80.0,
+    lifter: int = 0,
+    dct_norm: Literal["ortho"] | None = "ortho",
+) -> tuple[mx.array, ...]:
+    requested = _normalize_spectral_feature_names(include)
+    if lifter < 0:
+        raise ValueError("lifter must be >= 0")
+    freqs: mx.array | None = None
+    centroid: mx.array | None = None
+    power: mx.array | None = None
+    chroma_fb: mx.array | None = None
+    mel_fb: mx.array | None = None
+    dct_mat_t: mx.array | None = None
+    lifter_weights: mx.array | None = None
+    results: list[mx.array] = []
+    for name in requested:
+        if name == "chroma_stft":
+            if power is None:
+                power = mag * mag
+            if chroma_fb is None:
+                chroma_fb = _cached_chroma_filterbank(sample_rate, n_fft, n_chroma, tuning)
+            results.append(
+                _chroma_stft_from_power(
+                    power,
+                    chroma_fb=chroma_fb,
+                    norm=chroma_norm,
+                )
+            )
+            continue
+        if name == "mfcc":
+            if power is None:
+                power = mag * mag
+            if mel_fb is None:
+                f_max_resolved = float(sample_rate // 2 if f_max is None else f_max)
+                mel_fb = _cached_mel_filterbank(
+                    int(mag.shape[1]),
+                    float(f_min),
+                    f_max_resolved,
+                    int(n_mels),
+                    int(sample_rate),
+                    mel_norm,
+                    mel_scale,
+                )
+            if dct_mat_t is None:
+                dct_mat_t = _cached_dct_matrix_t(int(n_mfcc), int(n_mels), dct_norm)
+            if lifter > 0 and lifter_weights is None:
+                lifter_weights = _cached_lifter_weights(int(n_mfcc), int(lifter))
+            results.append(
+                _mfcc_from_power(
+                    power,
+                    mel_fb=mel_fb,
+                    dct_mat_t=dct_mat_t,
+                    top_db=top_db,
+                    lifter_weights=lifter_weights,
+                )
+            )
+            continue
+
+        if freqs is None:
+            freqs = _cached_fft_frequencies(sample_rate, n_fft)
+        if name == "spectral_centroid":
+            if centroid is None:
+                centroid = _spectral_centroid_from_mag(mag, freqs=freqs)
+            results.append(centroid)
+        elif name == "spectral_bandwidth":
+            if centroid is None:
+                centroid = _spectral_centroid_from_mag(mag, freqs=freqs)
+            results.append(
+                _spectral_bandwidth_from_mag(
+                    mag,
+                    freqs=freqs,
+                    p=bandwidth_p,
+                    centroid=centroid,
+                )
+            )
+        elif name == "spectral_rolloff":
+            results.append(
+                _spectral_rolloff_from_mag(
+                    mag,
+                    freqs=freqs,
+                    roll_percent=roll_percent,
+                )
+            )
+        elif name == "spectral_contrast":
+            results.append(
+                _spectral_contrast_from_mag(
+                    mag,
+                    sample_rate=sample_rate,
+                    n_fft=n_fft,
+                    n_bands=n_bands,
+                    fmin=contrast_fmin,
+                    quantile=contrast_quantile,
+                )
+            )
+        else:
+            raise ValueError(f"Unhandled spectral feature {name!r}")
+    return tuple(results)
+
+
+def _spectral_feature_values(
+    x: mx.array,
+    *,
+    include: tuple[str, ...],
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    n_chroma: int = 12,
+    chroma_norm: float | None = 2,
+    tuning: float = 0.0,
+    bandwidth_p: float = 2.0,
+    roll_percent: float = 0.85,
+    n_bands: int = 6,
+    contrast_fmin: float = 200.0,
+    contrast_quantile: float = 0.02,
+    n_mfcc: int = 20,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+    mel_norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: float | None = 80.0,
+    lifter: int = 0,
+    dct_norm: Literal["ortho"] | None = "ortho",
+) -> tuple[tuple[mx.array, ...], bool]:
+    requested = _normalize_spectral_feature_names(include)
+    mag, squeezed = _stft_magnitude(
+        x,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+    )
+    values = _spectral_feature_values_from_mag(
+        mag,
+        include=requested,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        n_chroma=n_chroma,
+        chroma_norm=chroma_norm,
+        tuning=tuning,
+        bandwidth_p=bandwidth_p,
+        roll_percent=roll_percent,
+        n_bands=n_bands,
+        contrast_fmin=contrast_fmin,
+        contrast_quantile=contrast_quantile,
+        n_mfcc=n_mfcc,
+        n_mels=n_mels,
+        f_min=f_min,
+        f_max=f_max,
+        mel_norm=mel_norm,
+        mel_scale=mel_scale,
+        top_db=top_db,
+        lifter=lifter,
+        dct_norm=dct_norm,
+    )
+    return values, squeezed
+
+
+def chroma_stft(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    n_chroma: int = 12,
+    norm: float | None = 2,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    tuning: float = 0.0,
+) -> mx.array:
+    """Compute chromagram from audio via STFT."""
+    (chroma_bcn,), squeezed = _spectral_feature_values(
+        x,
+        include=("chroma_stft",),
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        n_chroma=n_chroma,
+        chroma_norm=norm,
+        tuning=tuning,
+    )
+    return _restore_feature_batch(chroma_bcn, squeezed=squeezed)
+
+
+def spectral_features(
+    x: mx.array,
+    *,
+    include: tuple[str, ...] | list[str] | None = None,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    n_chroma: int = 12,
+    chroma_norm: float | None = 2,
+    tuning: float = 0.0,
+    bandwidth_p: float = 2.0,
+    roll_percent: float = 0.85,
+    n_bands: int = 6,
+    contrast_fmin: float = 200.0,
+    contrast_quantile: float = 0.02,
+    n_mfcc: int = 20,
+    n_mels: int = 128,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+    mel_norm: MelNorm = "slaney",
+    mel_scale: MelScale = "slaney",
+    top_db: float | None = 80.0,
+    lifter: int = 0,
+    dct_norm: Literal["ortho"] | None = "ortho",
+) -> dict[str, mx.array]:
+    """Compute several STFT-derived descriptors from one shared magnitude pass."""
+    requested = _normalize_spectral_feature_names(include)
+    values, squeezed = _spectral_feature_values(
+        x,
+        include=requested,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        n_chroma=n_chroma,
+        chroma_norm=chroma_norm,
+        tuning=tuning,
+        bandwidth_p=bandwidth_p,
+        roll_percent=roll_percent,
+        n_bands=n_bands,
+        contrast_fmin=contrast_fmin,
+        contrast_quantile=contrast_quantile,
+        n_mfcc=n_mfcc,
+        n_mels=n_mels,
+        f_min=f_min,
+        f_max=f_max,
+        mel_norm=mel_norm,
+        mel_scale=mel_scale,
+        top_db=top_db,
+        lifter=lifter,
+        dct_norm=dct_norm,
+    )
+    return OrderedDict(
+        (name, _restore_feature_batch(value, squeezed=squeezed))
+        for name, value in zip(requested, values)
+    )
+
+
+class SpectralFeatureTransform:
+    """Cached shared-STFT extractor for repeated spectral descriptor workloads."""
+
+    __slots__ = (
+        "include",
+        "sample_rate",
+        "n_fft",
+        "hop_length",
+        "win_length",
+        "window_fn",
+        "center",
+        "center_pad_mode",
+        "center_tail_pad",
+        "n_chroma",
+        "chroma_norm",
+        "tuning",
+        "bandwidth_p",
+        "roll_percent",
+        "n_bands",
+        "contrast_fmin",
+        "contrast_quantile",
+        "n_mfcc",
+        "n_mels",
+        "f_min",
+        "f_max",
+        "mel_norm",
+        "mel_scale",
+        "top_db",
+        "lifter",
+        "dct_norm",
+        "spectral",
+        "freqs",
+        "chroma_fb",
+        "mel_fb",
+        "dct_mat",
+        "_dct_mat_t",
+        "_lifter_weights",
+    )
+
+    def __init__(
+        self,
+        *,
+        include: tuple[str, ...] | list[str] | None = None,
+        sample_rate: int = 22_050,
+        n_fft: int = 2_048,
+        hop_length: int = 512,
+        win_length: int | None = None,
+        window_fn: str = "hann",
+        center: bool = True,
+        center_pad_mode: str = "reflect",
+        center_tail_pad: str = "symmetric",
+        n_chroma: int = 12,
+        chroma_norm: float | None = 2,
+        tuning: float = 0.0,
+        bandwidth_p: float = 2.0,
+        roll_percent: float = 0.85,
+        n_bands: int = 6,
+        contrast_fmin: float = 200.0,
+        contrast_quantile: float = 0.02,
+        n_mfcc: int = 20,
+        n_mels: int = 128,
+        f_min: float = 0.0,
+        f_max: float | None = None,
+        mel_norm: MelNorm = "slaney",
+        mel_scale: MelScale = "slaney",
+        top_db: float | None = 80.0,
+        lifter: int = 0,
+        dct_norm: Literal["ortho"] | None = "ortho",
+    ) -> None:
+        self.include = _normalize_spectral_feature_names(include)
+        self.sample_rate = int(sample_rate)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.win_length = int(win_length) if win_length is not None else int(n_fft)
+        self.window_fn = str(window_fn)
+        self.center = bool(center)
+        self.center_pad_mode = str(center_pad_mode)
+        self.center_tail_pad = str(center_tail_pad)
+        self.n_chroma = int(n_chroma)
+        self.chroma_norm = chroma_norm
+        self.tuning = float(tuning)
+        self.bandwidth_p = float(bandwidth_p)
+        self.roll_percent = float(roll_percent)
+        self.n_bands = int(n_bands)
+        self.contrast_fmin = float(contrast_fmin)
+        self.contrast_quantile = float(contrast_quantile)
+        self.n_mfcc = int(n_mfcc)
+        self.n_mels = int(n_mels)
+        self.f_min = float(f_min)
+        self.f_max = float(self.sample_rate // 2 if f_max is None else f_max)
+        self.mel_norm = mel_norm
+        self.mel_scale = mel_scale
+        self.top_db = top_db
+        self.lifter = int(lifter)
+        self.dct_norm = dct_norm
+        if self.bandwidth_p <= 0:
+            raise ValueError("bandwidth_p must be > 0")
+        if not 0.0 < self.roll_percent < 1.0:
+            raise ValueError("roll_percent must lie in the range (0, 1)")
+        if self.n_bands < 1:
+            raise ValueError("n_bands must be a positive integer")
+        if not 0.0 < self.contrast_quantile < 1.0:
+            raise ValueError("contrast_quantile must lie in the range (0, 1)")
+        if self.contrast_fmin <= 0.0:
+            raise ValueError("contrast_fmin must be a positive number")
+        if self.n_mfcc <= 0:
+            raise ValueError("n_mfcc must be > 0")
+        if self.n_mels <= 0:
+            raise ValueError("n_mels must be > 0")
+        if self.n_mfcc > self.n_mels:
+            raise ValueError("n_mfcc must be <= n_mels")
+        if self.lifter < 0:
+            raise ValueError("lifter must be >= 0")
+        if self.dct_norm not in (None, "ortho"):
+            raise ValueError('dct_norm must be one of {None, "ortho"}')
+
+        self.spectral = get_transform_mlx(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window_fn=self.window_fn,
+            periodic=True,
+            center=self.center,
+            normalized=False,
+            window=None,
+            center_pad_mode=self.center_pad_mode,
+            center_tail_pad=self.center_tail_pad,
+            istft_backend_policy=None,
+        )
+        self.freqs = _cached_fft_frequencies(self.sample_rate, self.n_fft)
+        self.chroma_fb = None
+        self.mel_fb = None
+        self.dct_mat = None
+        self._dct_mat_t = None
+        self._lifter_weights = None
+
+        if "chroma_stft" in self.include:
+            self.chroma_fb = _cached_chroma_filterbank(
+                self.sample_rate,
+                self.n_fft,
+                self.n_chroma,
+                self.tuning,
+            )
+        if "mfcc" in self.include:
+            self.mel_fb = _cached_mel_filterbank(
+                self.n_fft // 2 + 1,
+                self.f_min,
+                self.f_max,
+                self.n_mels,
+                self.sample_rate,
+                self.mel_norm,
+                self.mel_scale,
+            )
+            self.dct_mat = _cached_dct_matrix(self.n_mfcc, self.n_mels, self.dct_norm)
+            self._dct_mat_t = _cached_dct_matrix_t(self.n_mfcc, self.n_mels, self.dct_norm)
+            if self.lifter > 0:
+                self._lifter_weights = _cached_lifter_weights(self.n_mfcc, self.lifter)
+
+    def extract(self, x: mx.array) -> OrderedDict[str, mx.array]:
+        """Compute the configured feature set from a single shared STFT pass."""
+        x_b, squeezed = _ensure_audio_batch(x, fn_name="spectral_features")
+        effective_center_pad_mode = self.center_pad_mode
+        if (
+            self.center
+            and self.center_pad_mode == "reflect"
+            and int(x_b.shape[1]) <= (self.n_fft // 2)
+        ):
+            effective_center_pad_mode = "constant"
+        spec = (
+            self.spectral.stft(x_b, output_layout="bfn")
+            if effective_center_pad_mode == self.center_pad_mode
+            else get_transform_mlx(
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window_fn=self.window_fn,
+                periodic=True,
+                center=self.center,
+                normalized=False,
+                window=None,
+                center_pad_mode=effective_center_pad_mode,
+                center_tail_pad=self.center_tail_pad,
+                istft_backend_policy=None,
+            ).stft(x_b, output_layout="bfn")
+        )
+        mag = mx.abs(spec).astype(mx.float32)
+        power = None
+        centroid = None
+        out: OrderedDict[str, mx.array] = OrderedDict()
+        for name in self.include:
+            if name == "spectral_centroid":
+                if centroid is None:
+                    centroid = _spectral_centroid_from_mag(mag, freqs=self.freqs)
+                value = centroid
+            elif name == "spectral_bandwidth":
+                if centroid is None:
+                    centroid = _spectral_centroid_from_mag(mag, freqs=self.freqs)
+                value = _spectral_bandwidth_from_mag(
+                    mag,
+                    freqs=self.freqs,
+                    p=self.bandwidth_p,
+                    centroid=centroid,
+                )
+            elif name == "spectral_rolloff":
+                value = _spectral_rolloff_from_mag(
+                    mag,
+                    freqs=self.freqs,
+                    roll_percent=self.roll_percent,
+                )
+            elif name == "spectral_contrast":
+                value = _spectral_contrast_from_mag(
+                    mag,
+                    sample_rate=self.sample_rate,
+                    n_fft=self.n_fft,
+                    n_bands=self.n_bands,
+                    fmin=self.contrast_fmin,
+                    quantile=self.contrast_quantile,
+                )
+            elif name == "chroma_stft":
+                if power is None:
+                    power = mag * mag
+                value = _chroma_stft_from_power(
+                    power,
+                    chroma_fb=self.chroma_fb,
+                    norm=self.chroma_norm,
+                )
+            elif name == "mfcc":
+                if power is None:
+                    power = mag * mag
+                value = _mfcc_from_power(
+                    power,
+                    mel_fb=self.mel_fb,
+                    dct_mat_t=self._dct_mat_t,
+                    top_db=self.top_db,
+                    lifter_weights=self._lifter_weights,
+                )
+            else:
+                raise ValueError(f"Unhandled spectral feature {name!r}")
+            out[name] = _restore_feature_batch(value, squeezed=squeezed)
+        return out
+
+    def __call__(self, x: mx.array) -> OrderedDict[str, mx.array]:
+        return self.extract(x)
+
+
+def spectral_centroid(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+) -> mx.array:
+    """Weighted mean of frequencies per frame."""
+    (centroid,), squeezed = _spectral_feature_values(
+        x,
+        include=("spectral_centroid",),
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+    )
+    return _restore_feature_batch(centroid.astype(mx.float32), squeezed=squeezed)
+
+
+def spectral_bandwidth(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    p: float = 2.0,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+) -> mx.array:
+    """Weighted spectral bandwidth around the spectral centroid."""
+    (bandwidth,), squeezed = _spectral_feature_values(
+        x,
+        include=("spectral_bandwidth",),
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        bandwidth_p=p,
+    )
+    return _restore_feature_batch(bandwidth.astype(mx.float32), squeezed=squeezed)
+
+
+def spectral_rolloff(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    roll_percent: float = 0.85,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+) -> mx.array:
+    """Frequency below which ``roll_percent`` of spectral energy is contained."""
+    (roll,), squeezed = _spectral_feature_values(
+        x,
+        include=("spectral_rolloff",),
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        roll_percent=roll_percent,
+    )
+    return _restore_feature_batch(roll, squeezed=squeezed)
+
+
+def spectral_contrast(
+    x: mx.array,
+    *,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    n_bands: int = 6,
+    fmin: float = 200.0,
+    quantile: float = 0.02,
+    window_fn: str = "hann",
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+) -> mx.array:
+    """Peak-to-valley spectral contrast per octave subband."""
+    (contrast,), squeezed = _spectral_feature_values(
+        x,
+        include=("spectral_contrast",),
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window_fn=window_fn,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        n_bands=n_bands,
+        contrast_fmin=fmin,
+        contrast_quantile=quantile,
+    )
+    return _restore_feature_batch(contrast, squeezed=squeezed)
+
+
+def rms(
+    x: mx.array,
+    *,
+    frame_length: int = 2_048,
+    hop_length: int = 512,
+    center: bool = True,
+    pad_mode: str = "reflect",
+) -> mx.array:
+    """Root-mean-square energy per frame."""
+    frames, squeezed = _frame_signal(
+        x,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        center=center,
+        pad_mode=pad_mode,
+    )
+    power = mx.mean((frames.astype(mx.float32) ** 2), axis=-1)
+    out = mx.sqrt(power)[:, None, :].astype(mx.float32)
+    return _restore_feature_batch(out, squeezed=squeezed)
+
+
+def zero_crossing_rate(
+    x: mx.array,
+    *,
+    frame_length: int = 2_048,
+    hop_length: int = 512,
+    center: bool = True,
+    pad_mode: str = "reflect",
+) -> mx.array:
+    """Fraction of sign changes per frame."""
+    frames, squeezed = _frame_signal(
+        x,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        center=center,
+        pad_mode=pad_mode,
+    )
+    signs = frames >= 0
+    crossings = (signs[..., 1:] != signs[..., :-1]).astype(mx.float32)
+    rate = (mx.sum(crossings, axis=-1) / float(frame_length))[:, None, :].astype(mx.float32)
+    return _restore_feature_batch(rate, squeezed=squeezed)
 
 
 # ==============================================================================
