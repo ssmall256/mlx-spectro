@@ -125,7 +125,7 @@ def test_hybrid_cqt_compile_smoke():
         n_bins=84,
         bins_per_octave=12,
     )
-    compiled = mx.compile(lambda y: transform(y))
+    compiled = transform.get_compiled()
     eager = _to_numpy(transform(x))
     compiled_out = _to_numpy(compiled(x))
     np.testing.assert_allclose(eager, compiled_out, rtol=1e-5, atol=1e-5)

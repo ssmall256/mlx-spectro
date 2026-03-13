@@ -3772,6 +3772,7 @@ class HybridCQTTransform:
         "_octave_stfts",
         "_octave_short_stfts",
         "_scale_factors",
+        "_compiled_fn",
     )
 
     def __init__(
@@ -3901,6 +3902,7 @@ class HybridCQTTransform:
         self._octave_bases = tuple(octave_bases)
         self._octave_stfts = tuple(octave_stfts)
         self._octave_short_stfts = tuple(octave_short_stfts)
+        self._compiled_fn = None
 
     def hybrid_cqt(self, x: mx.array) -> mx.array:
         x_b, squeezed = _ensure_audio_batch(x, fn_name="hybrid_cqt")
@@ -3945,6 +3947,23 @@ class HybridCQTTransform:
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.hybrid_cqt(x)
+
+    def get_compiled(self):
+        """Return a cached compiled hybrid-CQT callable for steady-shape loops."""
+        cached = self._compiled_fn
+        if cached is not None:
+            return cached
+
+        @mx.compile
+        def _compiled(x: mx.array) -> mx.array:
+            return self.hybrid_cqt(x)
+
+        self._compiled_fn = _compiled
+        return _compiled
+
+    def hybrid_cqt_compiled(self, x: mx.array) -> mx.array:
+        """Execute hybrid CQT via a cached compiled callable."""
+        return self.get_compiled()(x)
 
 
 @lru_cache(maxsize=64)
@@ -5206,6 +5225,7 @@ class SpectralFeatureTransform:
         "_lifter_weights",
         "_short_spectral",
         "_contrast_bands",
+        "_compiled_values_fn",
     )
 
     def __init__(
@@ -5320,6 +5340,7 @@ class SpectralFeatureTransform:
         self.dct_mat = None
         self._dct_mat_t = None
         self._lifter_weights = None
+        self._compiled_values_fn = None
 
         if "chroma_stft" in self.include:
             self.chroma_fb = _cached_chroma_filterbank(
@@ -5423,6 +5444,25 @@ class SpectralFeatureTransform:
 
     def __call__(self, x: mx.array) -> OrderedDict[str, mx.array]:
         return self.extract(x)
+
+    def get_compiled_values(self):
+        """Return a cached compiled callable yielding values in ``include`` order."""
+        cached = self._compiled_values_fn
+        if cached is not None:
+            return cached
+
+        @mx.compile
+        def _compiled(x: mx.array):
+            out = self.extract(x)
+            return tuple(out[name] for name in self.include)
+
+        self._compiled_values_fn = _compiled
+        return _compiled
+
+    def extract_compiled(self, x: mx.array) -> OrderedDict[str, mx.array]:
+        """Execute feature extraction via a cached compiled callable."""
+        values = self.get_compiled_values()(x)
+        return OrderedDict((name, value) for name, value in zip(self.include, values))
 
 
 def spectral_centroid(

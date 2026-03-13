@@ -227,17 +227,17 @@ def benchmark_bundle(*, warmup: int, iters: int) -> None:
         def cached_call(x=x, tr=cached_transform):
             return tr(x)
 
-        def cached_compiled_call(x=x, tr=cached_transform):
-            out = tr(x)
-            return tuple(out[name] for name in FEATURE_NAMES)
+        compiled_values = cached_transform.get_compiled_values()
+
+        def cached_compiled_call(x=x, fn=compiled_values):
+            return fn(x)
 
         shared_compiled = mx.compile(shared_compiled_call)
-        cached_compiled = mx.compile(cached_compiled_call)
         seq_eager_ms = _bench(sequential_call, warmup=warmup, iters=iters)
         shared_eager_ms = _bench(shared_call, warmup=warmup, iters=iters)
         cached_eager_ms = _bench(cached_call, warmup=warmup, iters=iters)
         shared_compiled_ms = _bench(shared_compiled, warmup=warmup, iters=iters)
-        cached_compiled_ms = _bench(cached_compiled, warmup=warmup, iters=iters)
+        cached_compiled_ms = _bench(cached_compiled_call, warmup=warmup, iters=iters)
         rows.append(
             {
                 "label": label,

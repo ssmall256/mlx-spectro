@@ -64,6 +64,7 @@ def main() -> None:
     for batch, length in [(1, 22_050 * 5), (1, 22_050 * 15), (4, 22_050 * 5)]:
         x = _audio(length, batch=batch, seed=batch + length)
         transform = HybridCQTTransform(**kwargs)
+        compiled = transform.get_compiled()
 
         def wrapper_call():
             out = hybrid_cqt(x, **kwargs)
@@ -73,17 +74,23 @@ def main() -> None:
             out = transform(x)
             mx.eval(out)
 
+        def compiled_call():
+            out = compiled(x)
+            mx.eval(out)
+
         t0 = time.perf_counter()
         cold = transform(x)
         mx.eval(cold)
         cold_ms = (time.perf_counter() - t0) * 1000.0
         wrapper_ms = _bench(wrapper_call, warmup=warmup, iters=iters)
         cached_ms = _bench(cached_call, warmup=warmup, iters=iters)
+        compiled_ms = _bench(compiled_call, warmup=warmup, iters=iters)
 
         print(f"batch={batch} samples={length}")
         print(f"  cold cached transform: {cold_ms:7.3f} ms")
         print(f"  wrapper one-off:       {wrapper_ms:7.3f} ms")
         print(f"  cached transform:      {cached_ms:7.3f} ms")
+        print(f"  compiled transform:    {compiled_ms:7.3f} ms")
         print()
 
 

@@ -304,11 +304,7 @@ def test_spectral_feature_transform_reuses_cached_state_across_instances():
 def test_spectral_feature_transform_compile_smoke():
     tr = SpectralFeatureTransform(include=("spectral_centroid", "mfcc"))
     x = mx.array(_audio(seed=8))
-
-    @mx.compile
-    def compiled(inp: mx.array):
-        out = tr(inp)
-        return out["spectral_centroid"], out["mfcc"]
+    compiled = tr.get_compiled_values()
 
     eager = tr(x)
     compiled_centroid, compiled_mfcc = compiled(x)
@@ -330,6 +326,20 @@ def test_spectral_feature_transform_compile_smoke():
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_spectral_feature_transform_extract_compiled_matches_extract():
+    tr = SpectralFeatureTransform(include=("spectral_centroid", "spectral_contrast", "mfcc"))
+    x = mx.array(_audio(seed=18))
+    eager = tr(x)
+    compiled = tr.extract_compiled(x)
+    for key in tr.include:
+        np.testing.assert_allclose(
+            _to_numpy(eager[key]),
+            _to_numpy(compiled[key]),
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 def test_rms_zero_signal():
