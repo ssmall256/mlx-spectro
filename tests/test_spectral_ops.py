@@ -455,6 +455,30 @@ class TestEdgeCases:
             np.array(y), np.array(x), atol=1e-4, rtol=1e-4,
         )
 
+    def test_compiled_pair_nd_matches_packed_path(self):
+        """compiled_pair_nd matches eager reshape+packed STFT/iSTFT behavior."""
+        length = 12000
+        t = SpectralTransform(n_fft=1024, hop_length=256, window_fn="hann")
+        stft_nd, istft_nd = t.compiled_pair_nd(length=length, leading_shape=(2, 3), layout="bfn")
+
+        x = mx.random.normal((2, 3, length))
+        mx.eval(x)
+
+        z_nd = stft_nd(x)
+        y_nd = istft_nd(z_nd)
+        mx.eval(z_nd, y_nd)
+
+        x_packed = mx.reshape(x, (6, length))
+        z_ref = t.stft(x_packed, output_layout="bfn")
+        y_ref = t.istft(z_ref, length=length, input_layout="bfn")
+        mx.eval(z_ref, y_ref)
+        z_ref = mx.reshape(z_ref, z_nd.shape)
+        y_ref = mx.reshape(y_ref, y_nd.shape)
+
+        np.testing.assert_allclose(np.array(z_nd), np.array(z_ref), atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(np.array(y_nd), np.array(y_ref), atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(np.array(y_nd), np.array(x), atol=1e-4, rtol=1e-4)
+
     def test_fused_frame_extract_matches_fallback(self):
         """Fused Metal frame extraction produces bit-exact output vs fallback."""
         from mlx_spectro.spectral_ops import (

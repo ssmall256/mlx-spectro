@@ -239,6 +239,33 @@ def test_log_mel_add_matches_linear_postprocess():
     np.testing.assert_allclose(logged, ref, rtol=1e-6, atol=1e-6)
 
 
+def test_log_mel_log1p_matches_linear_postprocess():
+    rng = np.random.default_rng(19)
+    audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
+    transform = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        output_scale="log",
+        log_amin=1e-5,
+        log_mode="log1p",
+        log_scale=1000.0,
+    )
+    audio = mx.array(audio_np)
+    linear = _to_numpy(transform(audio, output_scale="linear"))
+    logged = _to_numpy(transform(audio))
+    ref = np.log1p(1000.0 * linear)
+    np.testing.assert_allclose(logged, ref, rtol=1e-6, atol=1e-6)
+
+
 def test_log_mel_helper_matches_explicit_transform():
     rng = np.random.default_rng(31)
     audio_np = rng.standard_normal((1, 12_000), dtype=np.float32) * 0.2

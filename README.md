@@ -1,6 +1,6 @@
 # mlx-spectro
 
-High-performance STFT/iSTFT for [Apple MLX](https://github.com/ml-explore/mlx) — **2–3x faster STFT** and **5–8x faster iSTFT** than `torch.stft`/`torch.istft` on MPS, via fused Metal kernels.
+High-performance spectral frontends for [Apple MLX](https://github.com/ml-explore/mlx): fast STFT/iSTFT, mel/log-mel/MFCC extraction, reusable filtered spectrograms, descriptor bundles, and hybrid CQT. The core STFT/iSTFT path remains **2–3x faster STFT** and **5–8x faster iSTFT** than `torch.stft`/`torch.istft` on MPS via fused Metal kernels.
 
 ```python
 from mlx_spectro import SpectralTransform
@@ -74,11 +74,11 @@ pip install mlx-spectro[torch]
 
 ## Features
 
-- Fused overlap-add with autotuned Metal kernels
-- PyTorch-compatible STFT/iSTFT semantics
-- Cached transforms for zero-overhead repeated calls
-- Differentiable transforms for training with `mx.grad`
-- `mx.compile`-friendly for tight inference loops
+- Fused overlap-add with autotuned Metal kernels for fast STFT/iSTFT
+- Cached reusable frontends for mel, log-mel, MFCC, filtered spectrograms, and hybrid CQT
+- Shared-STFT descriptor extraction and cached descriptor bundles for repeated-call workloads
+- PyTorch-, torchaudio-, librosa-, and madmom-style compatibility controls where parity matters
+- `mx.compile`-friendly helpers for fixed-shape inference loops, including multi-axis STFT/iSTFT pairs
 - Optional torch fallback for strict numerical parity
 
 ## Quick Start
@@ -99,6 +99,15 @@ reconstructed = transform.istft(spec, length=44100, input_layout="bnf")
 ```
 
 ## API
+
+The public API is grouped into six main areas:
+
+- Core STFT/iSTFT
+- Mel, log-mel, and MFCC frontends
+- Custom filtered frontends
+- Spectral descriptors and shared feature bundles
+- Hybrid CQT
+- Advanced helpers, diagnostics, and typing aliases
 
 ### `SpectralTransform`
 
@@ -124,6 +133,7 @@ SpectralTransform(
 - `stft(x, output_layout="bfn")` — Forward STFT. Input: `[T]` or `[B, T]`.
 - `istft(z, length=None, validate=False, *, torch_like=False, allow_fused=True, safety="auto", long_mode_strategy="native", backend_policy=None, input_layout="bfn")` — Inverse STFT. Returns `[B, T]`.
 - `compiled_pair(length, layout="bnf", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
+- `compiled_pair_nd(length, leading_shape, layout="bnf")` — Return compiled reshape-aware `(stft_fn, istft_fn)` for fixed multi-axis inputs such as `[B, C, T]`.
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
 - `prewarm_kernels(batch=1, length=None)` — Precompile eager STFT plus fused and legacy iSTFT kernels.
 - `prewarm_compiled(batch=1, length=None, ...)` — Precompile cached compiled STFT/iSTFT callables.
@@ -200,7 +210,8 @@ MelSpectrogramTransform(
     top_db: float | None = 80.0,
     output_scale: str = "db",     # "linear", "log", or "db"
     log_amin: float = 1e-5,
-    log_mode: str = "clamp",      # "clamp" or "add"
+    log_mode: str = "clamp",      # "clamp", "add", or "log1p"
+    log_scale: float = 1.0,       # used when log_mode="log1p"
     mode: str = "mlx_native",     # "mlx_native" or "torchaudio_compat"; "default" alias -> "mlx_native"
     window_fn: str = "hann",
     periodic: bool = True,
@@ -221,15 +232,86 @@ MelSpectrogramTransform(
 
 **Output scale semantics:**
 - `output_scale="linear"`: return linear mel values.
-- `output_scale="log"`: return natural-log mel using `log_mode` and `log_amin`.
+- `output_scale="log"`: return natural-log mel using `log_mode`, `log_amin`, and `log_scale`.
 - `output_scale="db"`: return dB mel; this preserves the current default behavior.
 - `to_db=True` and `to_db=False` remain supported as compatibility aliases for `output_scale="db"` and `output_scale="linear"`.
+
+**Log mode semantics:**
+- `log_mode="clamp"`: `log(max(x, log_amin))`
+- `log_mode="add"`: `log(x + log_amin)`
+- `log_mode="log1p"`: `log1p(log_scale * x)` for frontends that already define a fixed multiplicative scale before logging
 
 ### `LogMelSpectrogramTransform`
 
 Convenience wrapper for natural-log mel frontends. It is equivalent to `MelSpectrogramTransform(..., output_scale="log", ...)` and is intended for AMT/ASR-style pipelines that want log-mel directly instead of dB output.
 
 ### Feature Extraction
+
+### `FilteredSpectrogramTransform`
+
+Cached shared-STFT frontend for arbitrary filterbank projections.
+
+```python
+FilteredSpectrogramTransform(
+    filterbank: mx.array | np.ndarray,  # [n_freqs, n_bands]
+    sample_rate: int = 22050,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    win_length: int | None = None,
+    power: float = 1.0,
+    output_scale: str = "linear",  # "linear", "log", "db", "log10_plus_one"
+    top_db: float | None = None,
+    log_amin: float = 1e-5,
+    log_mode: str = "clamp",
+    window_fn: str = "hann",
+    periodic: bool = True,
+    center: bool = True,
+    center_pad_mode: str = "reflect",
+    center_tail_pad: str = "symmetric",
+    normalized: bool = False,
+)
+```
+
+**Methods:**
+- `filtered_spectrogram(x)` / `__call__(x)` — Returns `[n_bands, frames]` for 1-D input or `[B, n_bands, frames]` for batched input.
+
+This is the reusable path for project-specific frontends that apply non-mel filterbanks after one STFT magnitude pass, such as beat/chord/log-frequency pipelines.
+
+The transform accepts filterbanks with either `n_fft // 2 + 1` rows or `n_fft // 2` rows. The latter is useful for madmom-style frontends that intentionally drop the Nyquist bin before applying a custom filterbank.
+
+### `filtered_spectrogram(x, *, filterbank, sample_rate=22050, n_fft=2048, hop_length=512, ..., output_scale="linear")`
+
+Functional one-off helper with the same parameters as `FilteredSpectrogramTransform`.
+
+### `log_triangular_fbanks(n_freqs, sample_rate, bands_per_octave, *, f_min, f_max, f_ref=440.0, norm_filters=True, unique_bins=True, include_nyquist=False)`
+
+Build logarithmically spaced triangular filterbanks for custom spectrogram frontends. Use `f_ref=440.0` for the madmom-style `f_ref`-anchored family and `f_ref=None` for the `f_min`-anchored family used by some beat frontends. Returns `[n_freqs, n_bands]`.
+
+### `HybridCQTTransform`
+
+Cached hybrid CQT frontend intended for `librosa.hybrid_cqt`-style pipelines and repeated inference workloads.
+
+```python
+HybridCQTTransform(
+    sr: int = 22050,
+    hop_length: int = 512,
+    fmin: float = 32.70319566257483,
+    n_bins: int = 84,
+    bins_per_octave: int = 12,
+    filter_scale: float = 1.0,
+    norm: float = 1.0,
+    sparsity: float = 0.01,
+)
+```
+
+**Methods:**
+- `hybrid_cqt(x)` / `__call__(x)` — Returns `[n_bins, frames]` for 1-D input or `[B, n_bins, frames]` for batched input.
+
+Hybrid CQT basis construction is implemented directly in-package and cached at init time. Repeated calls stay on MLX tensors; no extra package dependencies are required beyond `numpy`.
+
+### `hybrid_cqt(x, *, sr=22050, hop_length=512, fmin=32.70319566257483, n_bins=84, bins_per_octave=12, filter_scale=1.0, norm=1.0, sparsity=0.01)`
+
+Functional one-off helper with the same parameters as `HybridCQTTransform`.
 
 ### `MFCCTransform`
 
@@ -273,6 +355,10 @@ Half-wave rectified spectral flux of a dB-scaled mel spectrogram, matching libro
 ### `onset_strength_multi(x, *, sample_rate=22050, n_fft=2048, hop_length=512, n_mels=128, ..., center_pad_mode="reflect", center_tail_pad="symmetric")`
 
 Per-band half-wave rectified spectral flux (before averaging across frequency). Returns `[n_mels, frames]` for 1-D input or `[B, n_mels, frames]` for batched input.
+
+### `positive_spectral_diff(x, *, lag=None, frame_size=None, hop_size=None, diff_ratio=0.5, time_axis=-1)`
+
+Half-wave rectified frame difference over the chosen time axis. Pass `lag` directly, or pass `frame_size` and `hop_size` to derive the madmom-style spectral-difference lag from a Hann window and `diff_ratio`.
 
 ### `chroma_stft(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, n_chroma=12, norm=2, ..., tuning=0.0)`
 
@@ -371,7 +457,8 @@ matches torchaudio's packed-batch clipping behavior, while
 
 The package also exports string-literal typing aliases for option-bearing APIs:
 `ISTFTBackendPolicy`, `STFTOutputLayout`, `CenterPadMode`,
-`CenterTailPad`, `MelScale`, `MelNorm`, `MelMode`, and `WindowLike`.
+`CenterTailPad`, `FilteredOutputScale`, `MelScale`, `MelNorm`, `MelMode`,
+`MelOutputScale`, `LogMelMode`, and `WindowLike`.
 
 ## Benchmarks
 
@@ -419,6 +506,7 @@ To reproduce:
 - Full suite: `python scripts/benchmark.py`
 - Dispatch overhead profile: `python scripts/benchmark.py --dispatch-profile`
 - Feature extraction bundle benchmarks: `python scripts/benchmark_features.py`
+- Hybrid CQT benchmarks: `python scripts/benchmark_hybrid_cqt.py`
 
 ### Real-world: mlx-audio-separator
 

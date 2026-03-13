@@ -1,4 +1,4 @@
-"""Reusable MLX spectral ops for STFT, mel, and MFCC frontends."""
+"""Reusable MLX spectral ops for STFT, mel, MFCC, and hybrid-CQT frontends."""
 
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
@@ -11,6 +11,8 @@ __all__ = [
     "SpectralTransform",
     "MelSpectrogramTransform",
     "LogMelSpectrogramTransform",
+    "FilteredSpectrogramTransform",
+    "HybridCQTTransform",
     "MFCCTransform",
     "SpectralFeatureTransform",
     "ISTFTBackendPolicy",
@@ -22,11 +24,16 @@ __all__ = [
     "MelMode",
     "MelOutputScale",
     "LogMelMode",
+    "FilteredOutputScale",
     "WindowLike",
     "make_window",
     "melscale_fbanks",
     "amplitude_to_db",
     "dct_matrix",
+    "log_triangular_fbanks",
+    "filtered_spectrogram",
+    "hybrid_cqt",
+    "positive_spectral_diff",
     "mfcc",
     "chroma_stft",
     "spectral_features",
@@ -64,7 +71,8 @@ MelScale = Literal["htk", "slaney"]
 MelNorm = Literal["slaney"] | None
 MelMode = Literal["mlx_native", "torchaudio_compat", "default"]
 MelOutputScale = Literal["linear", "log", "db"]
-LogMelMode = Literal["clamp", "add"]
+LogMelMode = Literal["clamp", "add", "log1p"]
+FilteredOutputScale = Literal["linear", "log", "db", "log10_plus_one"]
 
 _CACHE_STATS_ENABLED = (
     os.environ.get("SPEC_MLX_CACHE_STATS", "0").lower()
@@ -1821,6 +1829,21 @@ def _apply_mfcc_projection(
     return mfcc_bmn
 
 
+def _apply_log_scale(
+    x: mx.array,
+    *,
+    log_amin: float,
+    log_mode: LogMelMode,
+    log_scale: float = 1.0,
+) -> mx.array:
+    amin = mx.array(float(log_amin), dtype=mx.float32)
+    if log_mode == "add":
+        return mx.log(x + amin).astype(mx.float32)
+    if log_mode == "log1p":
+        return mx.log1p(float(log_scale) * x).astype(mx.float32)
+    return mx.log(mx.maximum(x, amin)).astype(mx.float32)
+
+
 _ISTFT_BACKEND_POLICIES = ("auto", "mlx_fft", "metal", "torch_fallback")
 _STFT_OUTPUT_LAYOUTS = ("bfn", "bnf")
 
@@ -1998,7 +2021,7 @@ class SpectralTransform:
         '_window_cache_sig',
         '_norm_factor', '_inv_norm_factor',
         '_cache_key', 'ola_denom', 'ola_denom_inv',
-        '_compiled_stft_fns', '_compiled_istft_fns',
+        '_compiled_stft_fns', '_compiled_istft_fns', '_compiled_pair_nd_fns',
         '_torch_window_cache', '_window_runtime_cache',
     )
 
@@ -2080,6 +2103,7 @@ class SpectralTransform:
         self._cache_key = None
         self._compiled_stft_fns = {}
         self._compiled_istft_fns = {}
+        self._compiled_pair_nd_fns = {}
         self._torch_window_cache: Dict[str, Any] = {}
 
     def _window_pair_for_dtype(self, dtype: Any) -> Tuple[mx.array, mx.array]:
@@ -2332,6 +2356,64 @@ class SpectralTransform:
             mx.eval(z_c, y_c)
 
         return stft_fn, istft_fn
+
+    def compiled_pair_nd(
+        self,
+        *,
+        length: int,
+        leading_shape: tuple[int, ...],
+        layout: str = "bnf",
+    ) -> tuple:
+        """Return compiled STFT/iSTFT callables for fixed leading dimensions.
+
+        This wraps the packed-batch STFT/iSTFT inside a compiled reshape so
+        callers with stable multi-axis layouts (for example ``[B, C, T]``)
+        can avoid paying Python reshape overhead on every call.
+        """
+        resolved_layout = _resolve_stft_output_layout(layout)
+        leading = tuple(int(dim) for dim in leading_shape)
+        if not leading:
+            raise ValueError("leading_shape must contain at least one dimension")
+        if any(dim <= 0 for dim in leading):
+            raise ValueError("leading_shape dimensions must be > 0")
+
+        key = (int(length), leading, str(resolved_layout))
+        cached = self._compiled_pair_nd_fns.get(key)
+        if cached is not None:
+            _record_cache_event("compiled_pair_nd_cache.hit", key=key)
+            return cached
+        _record_cache_event("compiled_pair_nd_cache.miss", key=key)
+
+        warmup_len = int(length)
+        packed = int(math.prod(leading))
+        # Prime the underlying caches and safety checks first.
+        self.compiled_pair(length=warmup_len, layout=resolved_layout, warmup_batch=packed)
+
+        x_warm = mx.zeros(leading + (warmup_len,), dtype=mx.float32)
+        z_warm = self.stft(mx.reshape(x_warm, (packed, warmup_len)), output_layout=resolved_layout)
+        mx.eval(z_warm)
+        inner_spec_shape = tuple(int(dim) for dim in z_warm.shape[1:])
+        output_audio_shape = leading + (warmup_len,)
+        output_spec_shape = leading + inner_spec_shape
+
+        @mx.compile
+        def _stft_nd(x: mx.array) -> mx.array:
+            x2 = mx.reshape(x, (packed, warmup_len))
+            z = self.stft(x2, output_layout=resolved_layout)
+            return mx.reshape(z, output_spec_shape)
+
+        @mx.compile
+        def _istft_nd(z: mx.array) -> mx.array:
+            z2 = mx.reshape(z, (packed,) + inner_spec_shape)
+            y = self.istft(z2, length=warmup_len, input_layout=resolved_layout, safety="auto")
+            return mx.reshape(y, output_audio_shape)
+
+        z_compiled = _stft_nd(x_warm)
+        y_compiled = _istft_nd(z_compiled)
+        mx.eval(z_compiled, y_compiled)
+
+        self._compiled_pair_nd_fns[key] = (_stft_nd, _istft_nd)
+        return self._compiled_pair_nd_fns[key]
 
     # ------------------------------------------------------------------
     # Differentiable STFT / iSTFT
@@ -3215,6 +3297,7 @@ class MelSpectrogramTransform:
         "output_scale",
         "log_amin",
         "log_mode",
+        "log_scale",
         "spectral",
         "mel_fb",
     )
@@ -3236,6 +3319,7 @@ class MelSpectrogramTransform:
         output_scale: MelOutputScale = "db",
         log_amin: float = 1e-5,
         log_mode: LogMelMode = "clamp",
+        log_scale: float = 1.0,
         mode: MelMode = "mlx_native",
         window_fn: str = "hann",
         periodic: bool = True,
@@ -3262,16 +3346,19 @@ class MelSpectrogramTransform:
         self.output_scale = str(output_scale)
         self.log_amin = float(log_amin)
         self.log_mode = str(log_mode)
+        self.log_scale = float(log_scale)
         if self.mode not in ("mlx_native", "torchaudio_compat"):
             raise ValueError('mode must be one of {"mlx_native", "torchaudio_compat", "default"}')
         if self.power <= 0:
             raise ValueError("power must be > 0")
         if self.output_scale not in ("linear", "log", "db"):
             raise ValueError('output_scale must be one of {"linear", "log", "db"}')
-        if self.log_mode not in ("clamp", "add"):
-            raise ValueError('log_mode must be one of {"clamp", "add"}')
+        if self.log_mode not in ("clamp", "add", "log1p"):
+            raise ValueError('log_mode must be one of {"clamp", "add", "log1p"}')
         if self.log_amin <= 0.0:
             raise ValueError("log_amin must be > 0")
+        if self.log_scale <= 0.0:
+            raise ValueError("log_scale must be > 0")
 
         self.spectral = get_transform_mlx(
             n_fft=self.n_fft,
@@ -3355,10 +3442,12 @@ class MelSpectrogramTransform:
         if output_scale == "linear":
             return mel_bmn
         if output_scale == "log":
-            amin = mx.array(self.log_amin, dtype=mx.float32)
-            if self.log_mode == "add":
-                return mx.log(mel_bmn + amin).astype(mx.float32)
-            return mx.log(mx.maximum(mel_bmn, amin)).astype(mx.float32)
+            return _apply_log_scale(
+                mel_bmn,
+                log_amin=self.log_amin,
+                log_mode=self.log_mode,
+                log_scale=self.log_scale,
+            )
         db_mode: Literal["torchaudio_compat", "per_example"] = (
             "torchaudio_compat" if self.mode == "torchaudio_compat" else "per_example"
         )
@@ -3395,14 +3484,483 @@ class LogMelSpectrogramTransform(MelSpectrogramTransform):
         *,
         log_amin: float = 1e-5,
         log_mode: LogMelMode = "clamp",
+        log_scale: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__(
             output_scale="log",
             log_amin=log_amin,
             log_mode=log_mode,
+            log_scale=log_scale,
             **kwargs,
         )
+
+
+class FilteredSpectrogramTransform:
+    """Cached shared-STFT frontend for arbitrary frequency-domain filterbanks."""
+
+    __slots__ = (
+        "sample_rate",
+        "n_fft",
+        "hop_length",
+        "win_length",
+        "power",
+        "output_scale",
+        "top_db",
+        "log_amin",
+        "log_mode",
+        "window_fn",
+        "periodic",
+        "center",
+        "center_pad_mode",
+        "center_tail_pad",
+        "normalized",
+        "filterbank",
+        "filterbank_n_freqs",
+        "spectral",
+    )
+
+    def __init__(
+        self,
+        *,
+        filterbank: mx.array | np.ndarray,
+        sample_rate: int = 22_050,
+        n_fft: int = 2_048,
+        hop_length: int = 512,
+        win_length: Optional[int] = None,
+        power: float = 1.0,
+        output_scale: FilteredOutputScale = "linear",
+        top_db: float | None = None,
+        log_amin: float = 1e-5,
+        log_mode: LogMelMode = "clamp",
+        window_fn: str = "hann",
+        periodic: bool = True,
+        center: bool = True,
+        center_pad_mode: CenterPadMode = "reflect",
+        center_tail_pad: CenterTailPad = "symmetric",
+        normalized: bool = False,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.win_length = int(win_length) if win_length is not None else int(n_fft)
+        self.power = float(power)
+        self.output_scale = str(output_scale)
+        self.top_db = top_db
+        self.log_amin = float(log_amin)
+        self.log_mode = str(log_mode)
+        self.window_fn = str(window_fn)
+        self.periodic = bool(periodic)
+        self.center = bool(center)
+        self.center_pad_mode = center_pad_mode
+        self.center_tail_pad = center_tail_pad
+        self.normalized = bool(normalized)
+        self.filterbank = mx.array(filterbank, dtype=mx.float32)
+        if self.power <= 0.0:
+            raise ValueError("power must be > 0")
+        if self.output_scale not in ("linear", "log", "db", "log10_plus_one"):
+            raise ValueError(
+                'output_scale must be one of {"linear", "log", "db", "log10_plus_one"}'
+            )
+        if self.log_mode not in ("clamp", "add", "log1p"):
+            raise ValueError('log_mode must be one of {"clamp", "add", "log1p"}')
+        if self.log_amin <= 0.0:
+            raise ValueError("log_amin must be > 0")
+        if self.filterbank.ndim != 2:
+            raise ValueError(f"filterbank must be rank-2 [n_freqs, n_bands], got {self.filterbank.shape}")
+        self.filterbank_n_freqs = int(self.filterbank.shape[0])
+        if self.filterbank_n_freqs not in (self.n_fft // 2, self.n_fft // 2 + 1):
+            raise ValueError(
+                f"filterbank axis 0 must have size {self.n_fft // 2} or {self.n_fft // 2 + 1} "
+                f"for n_fft={self.n_fft}, got {self.filterbank_n_freqs}"
+            )
+        self.spectral = get_transform_mlx(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window_fn=self.window_fn,
+            periodic=self.periodic,
+            center=self.center,
+            normalized=self.normalized,
+            window=None,
+            center_pad_mode=self.center_pad_mode,
+            center_tail_pad=self.center_tail_pad,
+            istft_backend_policy=None,
+        )
+
+    def _filtered_linear(self, x: mx.array) -> tuple[mx.array, bool]:
+        x_b, squeezed = _ensure_audio_batch(x, fn_name="filtered_spectrogram")
+        if (
+            self.center
+            and self.center_pad_mode == "reflect"
+            and int(x_b.shape[1]) <= (self.n_fft // 2)
+        ):
+            mag_bfn, _ = _stft_magnitude(
+                x_b,
+                sample_rate=self.sample_rate,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window_fn=self.window_fn,
+                periodic=self.periodic,
+                center=self.center,
+                center_pad_mode=self.center_pad_mode,
+                center_tail_pad=self.center_tail_pad,
+            )
+        else:
+            spec = self.spectral.stft(x_b, output_layout="bfn")
+            mag_bfn = mx.abs(spec).astype(mx.float32)
+        if int(mag_bfn.shape[1]) != self.filterbank_n_freqs:
+            mag_bfn = mag_bfn[:, : self.filterbank_n_freqs, :]
+        if self.power == 1.0:
+            spec_bfn = mag_bfn
+        elif self.power == 2.0:
+            spec_bfn = mag_bfn * mag_bfn
+        else:
+            spec_bfn = mag_bfn ** self.power
+        filtered_bnt = mx.matmul(mx.transpose(spec_bfn, (0, 2, 1)), self.filterbank)
+        filtered_btn = mx.transpose(filtered_bnt, (0, 2, 1)).astype(mx.float32)
+        return filtered_btn, squeezed
+
+    def _apply_output_scale(self, filtered_btn: mx.array) -> mx.array:
+        if self.output_scale == "linear":
+            return filtered_btn
+        if self.output_scale == "log":
+            return _apply_log_scale(
+                filtered_btn,
+                log_amin=self.log_amin,
+                log_mode=self.log_mode,
+            )
+        if self.output_scale == "log10_plus_one":
+            return mx.log10(filtered_btn + 1.0).astype(mx.float32)
+        stype: Literal["power", "magnitude"] = "magnitude" if self.power == 1.0 else "power"
+        return amplitude_to_db(
+            filtered_btn,
+            stype=stype,
+            top_db=self.top_db,
+            mode="per_example",
+        ).astype(mx.float32)
+
+    def filtered_spectrogram(self, x: mx.array) -> mx.array:
+        filtered_btn, squeezed = self._filtered_linear(x)
+        out = self._apply_output_scale(filtered_btn)
+        return _restore_feature_batch(out, squeezed=squeezed)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.filtered_spectrogram(x)
+
+
+def filtered_spectrogram(
+    x: mx.array,
+    *,
+    filterbank: mx.array | np.ndarray,
+    sample_rate: int = 22_050,
+    n_fft: int = 2_048,
+    hop_length: int = 512,
+    win_length: Optional[int] = None,
+    power: float = 1.0,
+    output_scale: FilteredOutputScale = "linear",
+    top_db: float | None = None,
+    log_amin: float = 1e-5,
+    log_mode: LogMelMode = "clamp",
+    window_fn: str = "hann",
+    periodic: bool = True,
+    center: bool = True,
+    center_pad_mode: CenterPadMode = "reflect",
+    center_tail_pad: CenterTailPad = "symmetric",
+    normalized: bool = False,
+) -> mx.array:
+    transform = FilteredSpectrogramTransform(
+        filterbank=filterbank,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        power=power,
+        output_scale=output_scale,
+        top_db=top_db,
+        log_amin=log_amin,
+        log_mode=log_mode,
+        window_fn=window_fn,
+        periodic=periodic,
+        center=center,
+        center_pad_mode=center_pad_mode,
+        center_tail_pad=center_tail_pad,
+        normalized=normalized,
+    )
+    return transform(x)
+
+
+def _diff_frames_from_hann(
+    *,
+    frame_size: int,
+    hop_size: int,
+    diff_ratio: float = 0.5,
+) -> int:
+    frame_size = int(frame_size)
+    hop_size = int(hop_size)
+    diff_ratio = float(diff_ratio)
+    if frame_size <= 0:
+        raise ValueError("frame_size must be > 0")
+    if hop_size <= 0:
+        raise ValueError("hop_size must be > 0")
+    if not (0.0 < diff_ratio <= 1.0):
+        raise ValueError("diff_ratio must be in (0, 1]")
+    window = np.hanning(frame_size)
+    sample = int(np.argmax(window > diff_ratio * float(window.max())))
+    diff_samples = len(window) / 2 - sample
+    return int(max(1, round(diff_samples / hop_size)))
+
+
+def positive_spectral_diff(
+    x: mx.array,
+    *,
+    lag: int | None = None,
+    frame_size: int | None = None,
+    hop_size: int | None = None,
+    diff_ratio: float = 0.5,
+    time_axis: int = -1,
+) -> mx.array:
+    """Half-wave rectified spectral difference over the frame axis."""
+    if x.ndim < 2:
+        raise ValueError(f"positive_spectral_diff expects at least 2 dims, got {x.shape}")
+    if lag is not None and (frame_size is not None or hop_size is not None):
+        raise ValueError("pass either lag or frame_size/hop_size, not both")
+    if lag is None:
+        if frame_size is None or hop_size is None:
+            lag = 1
+        else:
+            lag = _diff_frames_from_hann(
+                frame_size=int(frame_size),
+                hop_size=int(hop_size),
+                diff_ratio=diff_ratio,
+            )
+    lag = int(lag)
+    if lag <= 0:
+        raise ValueError("lag must be > 0")
+    axis = int(time_axis)
+    axis = axis if axis >= 0 else x.ndim + axis
+    if axis < 0 or axis >= x.ndim:
+        raise ValueError(f"time_axis {time_axis} is out of bounds for shape {x.shape}")
+    moved = mx.moveaxis(x, axis, -1)
+    diff = mx.zeros_like(moved)
+    diff[..., lag:] = moved[..., lag:] - moved[..., :-lag]
+    diff = mx.maximum(diff, 0.0).astype(mx.float32)
+    return mx.moveaxis(diff, -1, axis)
+
+
+class HybridCQTTransform:
+    """Hybrid CQT built from cached CQT bases plus shared STFT transforms."""
+
+    __slots__ = (
+        "sr",
+        "hop_length",
+        "fmin",
+        "n_bins",
+        "bins_per_octave",
+        "filter_scale",
+        "norm",
+        "sparsity",
+        "n_pseudo",
+        "n_full",
+        "n_octaves",
+        "_pseudo_basis",
+        "_pseudo_scale",
+        "_pseudo_stft",
+        "_octave_bases",
+        "_octave_stfts",
+        "_scale_factors",
+    )
+
+    def __init__(
+        self,
+        *,
+        sr: int = 22_050,
+        hop_length: int = 512,
+        fmin: float = 32.70319566257483,
+        n_bins: int = 84,
+        bins_per_octave: int = 12,
+        filter_scale: float = 1.0,
+        norm: float = 1.0,
+        sparsity: float = 0.01,
+    ) -> None:
+        self.sr = int(sr)
+        self.hop_length = int(hop_length)
+        self.fmin = float(fmin)
+        self.n_bins = int(n_bins)
+        self.bins_per_octave = int(bins_per_octave)
+        self.filter_scale = float(filter_scale)
+        self.norm = float(norm)
+        self.sparsity = float(sparsity)
+        if self.sr <= 0:
+            raise ValueError("sr must be > 0")
+        if self.hop_length <= 0:
+            raise ValueError("hop_length must be > 0")
+        if self.fmin <= 0.0:
+            raise ValueError("fmin must be > 0")
+        if self.n_bins <= 0:
+            raise ValueError("n_bins must be > 0")
+        if self.bins_per_octave <= 0:
+            raise ValueError("bins_per_octave must be > 0")
+        if self.filter_scale <= 0.0:
+            raise ValueError("filter_scale must be > 0")
+        if self.norm <= 0.0:
+            raise ValueError("norm must be > 0")
+        if not 0.0 <= self.sparsity < 1.0:
+            raise ValueError("sparsity must lie in [0, 1)")
+
+        plan = _cached_hybrid_cqt_plan(
+            self.sr,
+            self.hop_length,
+            self.fmin,
+            self.n_bins,
+            self.bins_per_octave,
+            self.filter_scale,
+            self.norm,
+            self.sparsity,
+        )
+        self.n_pseudo = int(plan["n_pseudo"])
+        self.n_full = int(plan["n_full"])
+        self.n_octaves = int(plan["n_octaves"])
+        self._scale_factors = plan["scale_factors"]
+
+        pseudo_plan = plan["pseudo"]
+        if pseudo_plan is None:
+            self._pseudo_basis = None
+            self._pseudo_scale = None
+            self._pseudo_stft = None
+        else:
+            pseudo_nfft = int(pseudo_plan["n_fft"])
+            self._pseudo_basis = pseudo_plan["basis"]
+            self._pseudo_scale = float(pseudo_plan["scale"])
+            self._pseudo_stft = get_transform_mlx(
+                n_fft=pseudo_nfft,
+                hop_length=self.hop_length,
+                win_length=pseudo_nfft,
+                window_fn="hann",
+                periodic=True,
+                center=True,
+                normalized=False,
+                window=None,
+                center_pad_mode="reflect",
+                center_tail_pad="symmetric",
+                istft_backend_policy=None,
+            )
+
+        octave_bases: list[mx.array] = []
+        octave_stfts: list[SpectralTransform] = []
+        for basis, octave_nfft, octave_hop in plan["octaves"]:
+            octave_bases.append(basis)
+            octave_stfts.append(
+                get_transform_mlx(
+                    n_fft=int(octave_nfft),
+                    hop_length=int(octave_hop),
+                    win_length=int(octave_nfft),
+                    window_fn="hann",
+                    periodic=True,
+                    center=True,
+                    normalized=False,
+                    window=None,
+                    center_pad_mode="reflect",
+                    center_tail_pad="symmetric",
+                    istft_backend_policy=None,
+                )
+            )
+        self._octave_bases = tuple(octave_bases)
+        self._octave_stfts = tuple(octave_stfts)
+
+    def hybrid_cqt(self, x: mx.array) -> mx.array:
+        x_b, squeezed = _ensure_audio_batch(x, fn_name="hybrid_cqt")
+        results: list[mx.array] = []
+
+        if self.n_full > 0:
+            octave_results: list[mx.array] = []
+            octave_audio = x_b
+            for idx, stft in enumerate(self._octave_stfts):
+                current_stft = stft
+                if int(octave_audio.shape[1]) <= (int(stft.n_fft) // 2):
+                    current_stft = get_transform_mlx(
+                        n_fft=int(stft.n_fft),
+                        hop_length=int(stft.hop_length),
+                        win_length=int(stft.win_length),
+                        window_fn=stft.window_fn,
+                        periodic=stft.periodic,
+                        center=stft.center,
+                        normalized=stft.normalized,
+                        window=None,
+                        center_pad_mode="constant",
+                        center_tail_pad=stft.center_tail_pad,
+                        istft_backend_policy=None,
+                    )
+                spec = current_stft.stft(octave_audio, output_layout="bfn")
+                cqt_oct = mx.abs(mx.matmul(self._octave_bases[idx][None, :, :], spec)).astype(mx.float32)
+                octave_results.append(cqt_oct)
+                if idx < len(self._octave_stfts) - 1:
+                    octave_audio = _downsample_2x_batched(octave_audio)
+            min_frames = min(int(o.shape[2]) for o in octave_results)
+            trimmed = [o[:, :, :min_frames] for o in octave_results]
+            trimmed.reverse()
+            results.append(mx.concatenate(trimmed, axis=1))
+
+        if self.n_pseudo > 0:
+            assert self._pseudo_basis is not None
+            assert self._pseudo_scale is not None
+            assert self._pseudo_stft is not None
+            pseudo_stft = self._pseudo_stft
+            if int(x_b.shape[1]) <= (int(self._pseudo_stft.n_fft) // 2):
+                pseudo_stft = get_transform_mlx(
+                    n_fft=int(self._pseudo_stft.n_fft),
+                    hop_length=int(self._pseudo_stft.hop_length),
+                    win_length=int(self._pseudo_stft.win_length),
+                    window_fn=self._pseudo_stft.window_fn,
+                    periodic=self._pseudo_stft.periodic,
+                    center=self._pseudo_stft.center,
+                    normalized=self._pseudo_stft.normalized,
+                    window=None,
+                    center_pad_mode="constant",
+                    center_tail_pad=self._pseudo_stft.center_tail_pad,
+                    istft_backend_policy=None,
+                )
+            spec_mag = mx.abs(pseudo_stft.stft(x_b, output_layout="bfn")).astype(mx.float32)
+            pseudo_cqt = (
+                mx.matmul(self._pseudo_basis[None, :, :], spec_mag) / float(self._pseudo_scale)
+            ).astype(mx.float32)
+            results.append(pseudo_cqt)
+
+        if not results:
+            raise RuntimeError("HybridCQTTransform produced no octave results")
+        cqt = mx.concatenate(results, axis=1)
+        cqt = (cqt * self._scale_factors[None, :, None]).astype(mx.float32)
+        return _restore_feature_batch(cqt, squeezed=squeezed)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.hybrid_cqt(x)
+
+
+def hybrid_cqt(
+    x: mx.array,
+    *,
+    sr: int = 22_050,
+    hop_length: int = 512,
+    fmin: float = 32.70319566257483,
+    n_bins: int = 84,
+    bins_per_octave: int = 12,
+    filter_scale: float = 1.0,
+    norm: float = 1.0,
+    sparsity: float = 0.01,
+) -> mx.array:
+    """Compute a hybrid CQT magnitude spectrogram from audio."""
+    transform = HybridCQTTransform(
+        sr=sr,
+        hop_length=hop_length,
+        fmin=fmin,
+        n_bins=n_bins,
+        bins_per_octave=bins_per_octave,
+        filter_scale=filter_scale,
+        norm=norm,
+        sparsity=sparsity,
+    )
+    return transform(x)
 
 
 class MFCCTransform:
@@ -3631,6 +4189,111 @@ def _fft_frequencies(sample_rate: int, n_fft: int) -> mx.array:
     return mx.array(freqs, dtype=mx.float32)
 
 
+def _fft_bin_frequencies(
+    sample_rate: int,
+    n_freqs: int,
+    *,
+    include_nyquist: bool,
+) -> np.ndarray:
+    sample_rate = int(sample_rate)
+    n_freqs = int(n_freqs)
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be > 0")
+    if n_freqs <= 1:
+        raise ValueError("n_freqs must be > 1")
+    if include_nyquist:
+        n_fft = (n_freqs - 1) * 2
+        return np.fft.rfftfreq(n=n_fft, d=1.0 / float(sample_rate)).astype(np.float32)
+    n_fft = n_freqs * 2
+    return np.fft.fftfreq(n_fft, d=1.0 / float(sample_rate))[:n_freqs].astype(np.float32)
+
+
+def log_triangular_fbanks(
+    n_freqs: int,
+    sample_rate: int,
+    bands_per_octave: int,
+    *,
+    f_min: float,
+    f_max: float,
+    f_ref: float | None = 440.0,
+    norm_filters: bool = True,
+    unique_bins: bool = True,
+    include_nyquist: bool = False,
+) -> mx.array:
+    n_freqs = int(n_freqs)
+    sample_rate = int(sample_rate)
+    bands_per_octave = int(bands_per_octave)
+    f_min = float(f_min)
+    f_max = float(f_max)
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be > 0")
+    if n_freqs <= 1:
+        raise ValueError("n_freqs must be > 1")
+    if bands_per_octave <= 0:
+        raise ValueError("bands_per_octave must be > 0")
+    if f_min <= 0.0:
+        raise ValueError("f_min must be > 0")
+    if f_max <= f_min:
+        raise ValueError("f_max must be > f_min")
+    if f_ref is not None:
+        f_ref = float(f_ref)
+        if f_ref <= 0.0:
+            raise ValueError("f_ref must be > 0")
+
+    bin_frequencies = _fft_bin_frequencies(
+        sample_rate,
+        n_freqs,
+        include_nyquist=bool(include_nyquist),
+    )
+    if f_ref is None:
+        num_octaves = np.log2(f_max / f_min)
+        num_bands = int(np.round(bands_per_octave * num_octaves))
+        centers = f_min * 2.0 ** (np.arange(num_bands + 2) / float(bands_per_octave))
+    else:
+        left = np.floor(np.log2(f_min / f_ref) * bands_per_octave)
+        right = np.ceil(np.log2(f_max / f_ref) * bands_per_octave)
+        centers = f_ref * 2.0 ** (np.arange(left, right) / float(bands_per_octave))
+        centers = centers[np.searchsorted(centers, f_min):]
+        centers = centers[: np.searchsorted(centers, f_max, side="right")]
+    if centers.size < 3:
+        raise ValueError("log_triangular_fbanks requires at least three center frequencies")
+
+    indices = bin_frequencies.searchsorted(centers)
+    indices = np.clip(indices, 1, len(bin_frequencies) - 1)
+    left_bins = bin_frequencies[indices - 1]
+    right_bins = bin_frequencies[indices]
+    indices -= centers - left_bins < right_bins - centers
+    if unique_bins:
+        indices = np.unique(indices)
+    if indices.size < 3:
+        raise ValueError("not enough distinct FFT bins to build log triangular filterbank")
+
+    filters: list[np.ndarray] = []
+    for start, center, stop in zip(indices[:-2], indices[1:-1], indices[2:]):
+        start_i = int(start)
+        center_i = int(center)
+        stop_i = int(stop)
+        if stop_i - start_i < 2:
+            center_i = start_i
+            stop_i = start_i + 1
+        center_rel = center_i - start_i
+        stop_rel = stop_i - start_i
+        filt = np.zeros(stop_rel, dtype=np.float32)
+        if center_rel > 0:
+            filt[:center_rel] = np.linspace(0.0, 1.0, center_rel, endpoint=False)
+        filt[center_rel:] = np.linspace(1.0, 0.0, stop_rel - center_rel, endpoint=False)
+        if norm_filters:
+            total = float(np.sum(filt))
+            if total > 0.0:
+                filt /= total
+        band = np.zeros(n_freqs, dtype=np.float32)
+        band[start_i:stop_i] = filt
+        filters.append(band)
+    if not filters:
+        raise ValueError("log_triangular_fbanks produced no filters")
+    return mx.array(np.stack(filters, axis=1), dtype=mx.float32)
+
+
 @lru_cache(maxsize=128)
 def _cached_fft_frequencies(sample_rate: int, n_fft: int) -> mx.array:
     return _fft_frequencies(int(sample_rate), int(n_fft))
@@ -3643,6 +4306,227 @@ def _cached_dct_matrix_t(
     norm: Literal["ortho"] | None,
 ) -> mx.array:
     return mx.transpose(_cached_dct_matrix(int(n_mfcc), int(n_mels), norm), (1, 0))
+
+
+def _cqt_frequencies(
+    n_bins: int,
+    *,
+    fmin: float,
+    bins_per_octave: int,
+) -> np.ndarray:
+    n_bins = int(n_bins)
+    fmin = float(fmin)
+    bins_per_octave = int(bins_per_octave)
+    if n_bins <= 0:
+        raise ValueError("n_bins must be > 0")
+    if fmin <= 0.0:
+        raise ValueError("fmin must be > 0")
+    if bins_per_octave <= 0:
+        raise ValueError("bins_per_octave must be > 0")
+    return fmin * (2.0 ** (np.arange(n_bins, dtype=np.float64) / float(bins_per_octave)))
+
+
+def _relative_bandwidth(freqs: np.ndarray) -> np.ndarray:
+    freqs = np.asarray(freqs, dtype=np.float64)
+    if freqs.ndim != 1 or freqs.size == 0:
+        raise ValueError("freqs must be a non-empty 1-D array")
+    if freqs.size == 1:
+        return np.ones((1,), dtype=np.float64)
+    ratio = float(freqs[1] / freqs[0])
+    alpha = (ratio * ratio - 1.0) / (ratio * ratio + 1.0)
+    return np.full(freqs.shape, alpha, dtype=np.float64)
+
+
+def _wavelet_lengths(
+    *,
+    freqs: np.ndarray,
+    sr: float,
+    filter_scale: float,
+    alpha: np.ndarray,
+    gamma: float = 0.0,
+) -> np.ndarray:
+    freqs = np.asarray(freqs, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.float64)
+    if freqs.shape != alpha.shape:
+        raise ValueError("freqs and alpha must have matching shape")
+    if np.any(freqs <= 0.0):
+        raise ValueError("freqs must be strictly positive")
+    if np.any(alpha <= 0.0):
+        raise ValueError("alpha must be strictly positive")
+    gamma_term = float(gamma) / alpha
+    q = float(filter_scale) / alpha
+    return q * float(sr) / (freqs + gamma_term)
+
+
+def _build_cqt_fft_basis(
+    *,
+    sr: float,
+    freqs: np.ndarray,
+    filter_scale: float,
+    norm: float,
+    sparsity: float,
+    alpha: np.ndarray,
+    gamma: float = 0.0,
+    hop_length: int | None = None,
+) -> tuple[np.ndarray, int, np.ndarray]:
+    lengths = _wavelet_lengths(
+        freqs=np.asarray(freqs, dtype=np.float64),
+        sr=float(sr),
+        filter_scale=float(filter_scale),
+        alpha=np.asarray(alpha, dtype=np.float64),
+        gamma=float(gamma),
+    )
+
+    filt_list: list[np.ndarray] = []
+    for ilen, freq in zip(lengths, freqs):
+        length_i = int(np.round(float(ilen)))
+        t = np.arange(-length_i // 2, length_i // 2, dtype=np.float64)
+        sig = np.exp(1j * 2.0 * np.pi * float(freq) / float(sr) * t)
+        sig = sig * np.hanning(len(sig))
+        if float(norm) == 1.0:
+            sig = sig / (np.sum(np.abs(sig)) + 1e-20)
+        filt_list.append(sig)
+
+    max_len = float(np.max(lengths))
+    n_fft = int(2.0 ** np.ceil(np.log2(max_len)))
+    if hop_length is not None:
+        n_fft = max(n_fft, int(2.0 ** (1 + np.ceil(np.log2(int(hop_length))))))
+
+    basis = np.zeros((len(freqs), n_fft), dtype=np.complex128)
+    for idx, filt in enumerate(filt_list):
+        pad_total = n_fft - len(filt)
+        pad_left = pad_total // 2
+        basis[idx, pad_left:pad_left + len(filt)] = filt
+    basis *= lengths[:, None] / float(n_fft)
+
+    fft_basis = np.fft.fft(basis, n=n_fft, axis=1)[:, : n_fft // 2 + 1]
+    if float(sparsity) > 0.0:
+        mags = np.abs(fft_basis)
+        for row in range(mags.shape[0]):
+            thresh = float(np.quantile(mags[row], float(sparsity)))
+            fft_basis[row, mags[row] <= thresh] = 0.0
+
+    return fft_basis.astype(np.complex64), int(n_fft), lengths
+
+
+@lru_cache(maxsize=64)
+def _cached_halfband_kernel() -> mx.array:
+    num_taps = 63
+    cutoff = 0.5
+    beta = 8.0
+    n = np.arange(num_taps, dtype=np.float64) - (num_taps - 1) / 2.0
+    ideal = cutoff * np.sinc(cutoff * n)
+    radius = (num_taps - 1) / 2.0
+    window_arg = np.sqrt(np.maximum(0.0, 1.0 - (n / radius) ** 2))
+    window = np.i0(beta * window_arg) / np.i0(beta)
+    kernel = (ideal * window).astype(np.float64)
+    kernel /= np.sum(kernel)
+    kernel = kernel.astype(np.float32)
+    return mx.array(kernel, dtype=mx.float32)[None, :, None]
+
+
+def _downsample_2x_batched(x: mx.array) -> mx.array:
+    squeezed = x.ndim == 1
+    if squeezed:
+        x = x[None, :]
+    elif x.ndim != 2:
+        raise ValueError(f"_downsample_2x_batched expects 1D or 2D input, got {x.shape}")
+
+    kernel = _cached_halfband_kernel()
+    x_pad = _pad_waveform(x, pad=31, mode="reflect")
+    out = mx.conv1d(x_pad[:, :, None], kernel, stride=2)
+    out = out[:, :, 0] * float(np.sqrt(2.0))
+    return out[0] if squeezed else out
+
+
+@lru_cache(maxsize=32)
+def _cached_hybrid_cqt_plan(
+    sr: int,
+    hop_length: int,
+    fmin: float,
+    n_bins: int,
+    bins_per_octave: int,
+    filter_scale: float,
+    norm: float,
+    sparsity: float,
+) -> dict[str, Any]:
+    freqs = np.asarray(
+        _cqt_frequencies(int(n_bins), fmin=float(fmin), bins_per_octave=int(bins_per_octave)),
+        dtype=np.float64,
+    )
+    alpha = _relative_bandwidth(freqs)
+    lengths = _wavelet_lengths(
+        freqs=freqs,
+        sr=float(sr),
+        filter_scale=float(filter_scale),
+        alpha=alpha,
+    )
+
+    pseudo_mask = 2.0 ** np.ceil(np.log2(lengths)) < 2.0 * float(hop_length)
+    n_pseudo = int(np.sum(pseudo_mask))
+    n_full = int(n_bins) - n_pseudo
+    n_octaves = int(np.ceil(n_full / float(bins_per_octave))) if n_full > 0 else 0
+
+    pseudo_plan = None
+    if n_pseudo > 0:
+        pseudo_freqs = freqs[pseudo_mask]
+        pseudo_alpha = alpha[pseudo_mask]
+        pseudo_fft_basis, pseudo_nfft, _ = _build_cqt_fft_basis(
+            sr=float(sr),
+            freqs=pseudo_freqs,
+            filter_scale=float(filter_scale),
+            norm=float(norm),
+            sparsity=float(sparsity),
+            alpha=pseudo_alpha,
+            hop_length=int(hop_length),
+        )
+        pseudo_plan = {
+            "n_fft": int(pseudo_nfft),
+            "basis": mx.array(np.abs(np.asarray(pseudo_fft_basis)).astype(np.float32), dtype=mx.float32),
+            "scale": float(np.sqrt(float(pseudo_nfft))),
+        }
+
+    octave_plans: list[tuple[mx.array, int, int]] = []
+    full_freqs = freqs[:n_full]
+    full_alpha = alpha[:n_full]
+    octave_sr = float(sr)
+    octave_hop = int(hop_length)
+    for octave_idx in range(n_octaves):
+        n_filt = int(bins_per_octave)
+        if octave_idx == 0:
+            sl = slice(-n_filt, None)
+        else:
+            sl = slice(-n_filt * (octave_idx + 1), -n_filt * octave_idx)
+        octave_freqs = full_freqs[sl]
+        octave_alpha = full_alpha[sl]
+        octave_fft_basis, octave_nfft, _ = _build_cqt_fft_basis(
+            sr=octave_sr,
+            freqs=octave_freqs,
+            filter_scale=float(filter_scale),
+            norm=float(norm),
+            sparsity=float(sparsity),
+            alpha=octave_alpha,
+            gamma=0.0,
+        )
+        octave_fft_basis = np.asarray(octave_fft_basis) * np.sqrt(float(sr) / octave_sr)
+        octave_plans.append(
+            (
+                mx.array(octave_fft_basis.astype(np.complex64), dtype=mx.complex64),
+                int(octave_nfft),
+                int(octave_hop),
+            )
+        )
+        octave_sr /= 2.0
+        octave_hop = max(1, octave_hop // 2)
+
+    return {
+        "n_pseudo": int(n_pseudo),
+        "n_full": int(n_full),
+        "n_octaves": int(n_octaves),
+        "pseudo": pseudo_plan,
+        "octaves": tuple(octave_plans),
+        "scale_factors": mx.array((1.0 / np.sqrt(lengths)).astype(np.float32), dtype=mx.float32),
+    }
 
 
 def _pad_waveform(
@@ -3706,6 +4590,7 @@ def _stft_magnitude(
     hop_length: int,
     win_length: Optional[int],
     window_fn: str,
+    periodic: bool,
     center: bool,
     center_pad_mode: CenterPadMode,
     center_tail_pad: CenterTailPad,
@@ -3726,7 +4611,7 @@ def _stft_magnitude(
         hop_length=hop_length,
         win_length=win_length,
         window_fn=str(window_fn),
-        periodic=True,
+        periodic=bool(periodic),
         center=bool(center),
         normalized=False,
         window=None,
@@ -4095,6 +4980,7 @@ def _spectral_feature_values(
         hop_length=hop_length,
         win_length=win_length,
         window_fn=window_fn,
+        periodic=True,
         center=center,
         center_pad_mode=center_pad_mode,
         center_tail_pad=center_tail_pad,
