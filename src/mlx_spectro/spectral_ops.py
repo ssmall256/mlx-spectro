@@ -4844,10 +4844,10 @@ def _spectral_contrast_from_mag(
 
     valley = mx.stack(valleys, axis=1).astype(mx.float32)
     peak = mx.stack(peaks, axis=1).astype(mx.float32)
-    return (
-        amplitude_to_db(peak, stype="power", top_db=None)
-        - amplitude_to_db(valley, stype="power", top_db=None)
-    ).astype(mx.float32)
+    amin = mx.array(1e-10, dtype=mx.float32)
+    peak_db = 10.0 * mx.log10(mx.maximum(peak, amin))
+    valley_db = 10.0 * mx.log10(mx.maximum(valley, amin))
+    return (peak_db - valley_db).astype(mx.float32)
 
 
 def _chroma_stft_from_power(
