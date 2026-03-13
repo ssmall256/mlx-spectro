@@ -3767,8 +3767,10 @@ class HybridCQTTransform:
         "_pseudo_basis",
         "_pseudo_scale",
         "_pseudo_stft",
+        "_pseudo_short_stft",
         "_octave_bases",
         "_octave_stfts",
+        "_octave_short_stfts",
         "_scale_factors",
     )
 
@@ -3829,6 +3831,7 @@ class HybridCQTTransform:
             self._pseudo_basis = None
             self._pseudo_scale = None
             self._pseudo_stft = None
+            self._pseudo_short_stft = None
         else:
             pseudo_nfft = int(pseudo_plan["n_fft"])
             self._pseudo_basis = pseudo_plan["basis"]
@@ -3846,9 +3849,23 @@ class HybridCQTTransform:
                 center_tail_pad="symmetric",
                 istft_backend_policy=None,
             )
+            self._pseudo_short_stft = get_transform_mlx(
+                n_fft=pseudo_nfft,
+                hop_length=self.hop_length,
+                win_length=pseudo_nfft,
+                window_fn="hann",
+                periodic=True,
+                center=True,
+                normalized=False,
+                window=None,
+                center_pad_mode="constant",
+                center_tail_pad="symmetric",
+                istft_backend_policy=None,
+            )
 
         octave_bases: list[mx.array] = []
         octave_stfts: list[SpectralTransform] = []
+        octave_short_stfts: list[SpectralTransform] = []
         for basis, octave_nfft, octave_hop in plan["octaves"]:
             octave_bases.append(basis)
             octave_stfts.append(
@@ -3866,8 +3883,24 @@ class HybridCQTTransform:
                     istft_backend_policy=None,
                 )
             )
+            octave_short_stfts.append(
+                get_transform_mlx(
+                    n_fft=int(octave_nfft),
+                    hop_length=int(octave_hop),
+                    win_length=int(octave_nfft),
+                    window_fn="hann",
+                    periodic=True,
+                    center=True,
+                    normalized=False,
+                    window=None,
+                    center_pad_mode="constant",
+                    center_tail_pad="symmetric",
+                    istft_backend_policy=None,
+                )
+            )
         self._octave_bases = tuple(octave_bases)
         self._octave_stfts = tuple(octave_stfts)
+        self._octave_short_stfts = tuple(octave_short_stfts)
 
     def hybrid_cqt(self, x: mx.array) -> mx.array:
         x_b, squeezed = _ensure_audio_batch(x, fn_name="hybrid_cqt")
@@ -3877,21 +3910,9 @@ class HybridCQTTransform:
             octave_results: list[mx.array] = []
             octave_audio = x_b
             for idx, stft in enumerate(self._octave_stfts):
-                current_stft = stft
-                if int(octave_audio.shape[1]) <= (int(stft.n_fft) // 2):
-                    current_stft = get_transform_mlx(
-                        n_fft=int(stft.n_fft),
-                        hop_length=int(stft.hop_length),
-                        win_length=int(stft.win_length),
-                        window_fn=stft.window_fn,
-                        periodic=stft.periodic,
-                        center=stft.center,
-                        normalized=stft.normalized,
-                        window=None,
-                        center_pad_mode="constant",
-                        center_tail_pad=stft.center_tail_pad,
-                        istft_backend_policy=None,
-                    )
+                current_stft = self._octave_short_stfts[idx]
+                if int(octave_audio.shape[1]) > (int(stft.n_fft) // 2):
+                    current_stft = stft
                 spec = current_stft.stft(octave_audio, output_layout="bfn")
                 cqt_oct = mx.abs(mx.matmul(self._octave_bases[idx][None, :, :], spec)).astype(mx.float32)
                 octave_results.append(cqt_oct)
@@ -3906,21 +3927,10 @@ class HybridCQTTransform:
             assert self._pseudo_basis is not None
             assert self._pseudo_scale is not None
             assert self._pseudo_stft is not None
-            pseudo_stft = self._pseudo_stft
-            if int(x_b.shape[1]) <= (int(self._pseudo_stft.n_fft) // 2):
-                pseudo_stft = get_transform_mlx(
-                    n_fft=int(self._pseudo_stft.n_fft),
-                    hop_length=int(self._pseudo_stft.hop_length),
-                    win_length=int(self._pseudo_stft.win_length),
-                    window_fn=self._pseudo_stft.window_fn,
-                    periodic=self._pseudo_stft.periodic,
-                    center=self._pseudo_stft.center,
-                    normalized=self._pseudo_stft.normalized,
-                    window=None,
-                    center_pad_mode="constant",
-                    center_tail_pad=self._pseudo_stft.center_tail_pad,
-                    istft_backend_policy=None,
-                )
+            pseudo_stft = self._pseudo_short_stft
+            if int(x_b.shape[1]) > (int(self._pseudo_stft.n_fft) // 2):
+                pseudo_stft = self._pseudo_stft
+            assert pseudo_stft is not None
             spec_mag = mx.abs(pseudo_stft.stft(x_b, output_layout="bfn")).astype(mx.float32)
             pseudo_cqt = (
                 mx.matmul(self._pseudo_basis[None, :, :], spec_mag) / float(self._pseudo_scale)
@@ -3937,6 +3947,29 @@ class HybridCQTTransform:
         return self.hybrid_cqt(x)
 
 
+@lru_cache(maxsize=64)
+def _cached_hybrid_cqt_transform(
+    sr: int,
+    hop_length: int,
+    fmin: float,
+    n_bins: int,
+    bins_per_octave: int,
+    filter_scale: float,
+    norm: float,
+    sparsity: float,
+) -> HybridCQTTransform:
+    return HybridCQTTransform(
+        sr=int(sr),
+        hop_length=int(hop_length),
+        fmin=float(fmin),
+        n_bins=int(n_bins),
+        bins_per_octave=int(bins_per_octave),
+        filter_scale=float(filter_scale),
+        norm=float(norm),
+        sparsity=float(sparsity),
+    )
+
+
 def hybrid_cqt(
     x: mx.array,
     *,
@@ -3950,15 +3983,15 @@ def hybrid_cqt(
     sparsity: float = 0.01,
 ) -> mx.array:
     """Compute a hybrid CQT magnitude spectrogram from audio."""
-    transform = HybridCQTTransform(
-        sr=sr,
-        hop_length=hop_length,
-        fmin=fmin,
-        n_bins=n_bins,
-        bins_per_octave=bins_per_octave,
-        filter_scale=filter_scale,
-        norm=norm,
-        sparsity=sparsity,
+    transform = _cached_hybrid_cqt_transform(
+        int(sr),
+        int(hop_length),
+        float(fmin),
+        int(n_bins),
+        int(bins_per_octave),
+        float(filter_scale),
+        float(norm),
+        float(sparsity),
     )
     return transform(x)
 
@@ -4297,6 +4330,35 @@ def log_triangular_fbanks(
 @lru_cache(maxsize=128)
 def _cached_fft_frequencies(sample_rate: int, n_fft: int) -> mx.array:
     return _fft_frequencies(int(sample_rate), int(n_fft))
+
+
+@lru_cache(maxsize=128)
+def _cached_spectral_contrast_bands(
+    sample_rate: int,
+    n_fft: int,
+    n_bands: int,
+    fmin: float,
+) -> tuple[tuple[int, int], ...]:
+    freq_np = np.linspace(0.0, float(sample_rate) / 2.0, int(n_fft // 2 + 1), dtype=np.float32)
+    octa = np.zeros(int(n_bands) + 2, dtype=np.float32)
+    octa[1:] = float(fmin) * (2.0 ** np.arange(0, int(n_bands) + 1))
+    if np.any(octa[:-1] >= 0.5 * float(sample_rate)):
+        raise ValueError("Frequency band exceeds Nyquist. Reduce either fmin or n_bands.")
+
+    bands: list[tuple[int, int]] = []
+    for k, (f_low, f_high) in enumerate(zip(octa[:-1], octa[1:])):
+        start = int(np.searchsorted(freq_np, f_low, side="left"))
+        end = int(np.searchsorted(freq_np, f_high, side="right"))
+        if end <= start:
+            end = min(start + 1, int(freq_np.shape[0]))
+        if k > 0:
+            start = max(start - 1, 0)
+        if k == int(n_bands):
+            end = int(freq_np.shape[0])
+        elif end - start > 1:
+            end -= 1
+        bands.append((start, end))
+    return tuple(bands)
 
 
 @lru_cache(maxsize=128)
@@ -4753,6 +4815,7 @@ def _spectral_contrast_from_mag(
     n_bands: int,
     fmin: float,
     quantile: float,
+    band_ranges: tuple[tuple[int, int], ...] | None = None,
 ) -> mx.array:
     if int(n_bands) < 1:
         raise ValueError("n_bands must be a positive integer")
@@ -4761,25 +4824,17 @@ def _spectral_contrast_from_mag(
     if float(fmin) <= 0.0:
         raise ValueError("fmin must be a positive number")
 
-    freq_np = np.asarray(_cached_fft_frequencies(sample_rate, n_fft), dtype=np.float32)
-    octa = np.zeros(int(n_bands) + 2, dtype=np.float32)
-    octa[1:] = float(fmin) * (2.0 ** np.arange(0, int(n_bands) + 1))
-    if np.any(octa[:-1] >= 0.5 * float(sample_rate)):
-        raise ValueError("Frequency band exceeds Nyquist. Reduce either fmin or n_bands.")
+    if band_ranges is None:
+        band_ranges = _cached_spectral_contrast_bands(
+            int(sample_rate),
+            int(n_fft),
+            int(n_bands),
+            float(fmin),
+        )
 
     valleys = []
     peaks = []
-    for k, (f_low, f_high) in enumerate(zip(octa[:-1], octa[1:])):
-        start = int(np.searchsorted(freq_np, f_low, side="left"))
-        end = int(np.searchsorted(freq_np, f_high, side="right"))
-        if end <= start:
-            end = min(start + 1, freq_np.shape[0])
-        if k > 0:
-            start = max(start - 1, 0)
-        if k == int(n_bands):
-            end = freq_np.shape[0]
-        elif end - start > 1:
-            end -= 1
+    for start, end in band_ranges:
         sub_band = mag[:, start:end, :]
         band_bins = int(sub_band.shape[1])
         idx = max(int(np.rint(float(quantile) * band_bins)), 1)
@@ -5149,6 +5204,8 @@ class SpectralFeatureTransform:
         "dct_mat",
         "_dct_mat_t",
         "_lifter_weights",
+        "_short_spectral",
+        "_contrast_bands",
     )
 
     def __init__(
@@ -5241,7 +5298,23 @@ class SpectralFeatureTransform:
             center_tail_pad=self.center_tail_pad,
             istft_backend_policy=None,
         )
+        self._short_spectral = None
+        if self.center and self.center_pad_mode == "reflect":
+            self._short_spectral = get_transform_mlx(
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window_fn=self.window_fn,
+                periodic=True,
+                center=self.center,
+                normalized=False,
+                window=None,
+                center_pad_mode="constant",
+                center_tail_pad=self.center_tail_pad,
+                istft_backend_policy=None,
+            )
         self.freqs = _cached_fft_frequencies(self.sample_rate, self.n_fft)
+        self._contrast_bands = None
         self.chroma_fb = None
         self.mel_fb = None
         self.dct_mat = None
@@ -5269,6 +5342,13 @@ class SpectralFeatureTransform:
             self._dct_mat_t = _cached_dct_matrix_t(self.n_mfcc, self.n_mels, self.dct_norm)
             if self.lifter > 0:
                 self._lifter_weights = _cached_lifter_weights(self.n_mfcc, self.lifter)
+        if "spectral_contrast" in self.include:
+            self._contrast_bands = _cached_spectral_contrast_bands(
+                self.sample_rate,
+                self.n_fft,
+                self.n_bands,
+                self.contrast_fmin,
+            )
 
     def extract(self, x: mx.array) -> OrderedDict[str, mx.array]:
         """Compute the configured feature set from a single shared STFT pass."""
@@ -5280,23 +5360,10 @@ class SpectralFeatureTransform:
             and int(x_b.shape[1]) <= (self.n_fft // 2)
         ):
             effective_center_pad_mode = "constant"
-        spec = (
-            self.spectral.stft(x_b, output_layout="bfn")
-            if effective_center_pad_mode == self.center_pad_mode
-            else get_transform_mlx(
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                window_fn=self.window_fn,
-                periodic=True,
-                center=self.center,
-                normalized=False,
-                window=None,
-                center_pad_mode=effective_center_pad_mode,
-                center_tail_pad=self.center_tail_pad,
-                istft_backend_policy=None,
-            ).stft(x_b, output_layout="bfn")
-        )
+        stft_transform = self.spectral
+        if effective_center_pad_mode != self.center_pad_mode and self._short_spectral is not None:
+            stft_transform = self._short_spectral
+        spec = stft_transform.stft(x_b, output_layout="bfn")
         mag = mx.abs(spec).astype(mx.float32)
         power = None
         centroid = None
@@ -5329,6 +5396,7 @@ class SpectralFeatureTransform:
                     n_bands=self.n_bands,
                     fmin=self.contrast_fmin,
                     quantile=self.contrast_quantile,
+                    band_ranges=self._contrast_bands,
                 )
             elif name == "chroma_stft":
                 if power is None:
