@@ -8,6 +8,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import time
 
 import mlx.core as mx
@@ -39,13 +41,7 @@ def _audio(length: int, *, batch: int, seed: int = 0) -> mx.array:
     return mx.array(data)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="mlx-spectro hybrid CQT benchmarks")
-    parser.add_argument("--quick", action="store_true", help="use fewer warmup/iteration steps")
-    args = parser.parse_args()
-
-    warmup = 2 if args.quick else 5
-    iters = 5 if args.quick else 20
+def benchmark_hybrid_cqt(*, warmup: int, iters: int, emit_markdown: bool = True) -> dict[str, object]:
     kwargs = dict(
         sr=22_050,
         hop_length=512,
@@ -57,10 +53,12 @@ def main() -> None:
         sparsity=0.01,
     )
 
-    print("## mlx-spectro hybrid CQT benchmark")
-    print(f"Device: {mx.default_device()}")
-    print()
+    if emit_markdown:
+        print("## mlx-spectro hybrid CQT benchmark")
+        print(f"Device: {mx.default_device()}")
+        print()
 
+    rows: list[dict[str, object]] = []
     for batch, length in [(1, 22_050 * 5), (1, 22_050 * 15), (4, 22_050 * 5)]:
         x = _audio(length, batch=batch, seed=batch + length)
         transform = HybridCQTTransform(**kwargs)
@@ -86,12 +84,54 @@ def main() -> None:
         cached_ms = _bench(cached_call, warmup=warmup, iters=iters)
         compiled_ms = _bench(compiled_call, warmup=warmup, iters=iters)
 
-        print(f"batch={batch} samples={length}")
-        print(f"  cold cached transform: {cold_ms:7.3f} ms")
-        print(f"  wrapper one-off:       {wrapper_ms:7.3f} ms")
-        print(f"  cached transform:      {cached_ms:7.3f} ms")
-        print(f"  compiled transform:    {compiled_ms:7.3f} ms")
-        print()
+        rows.append(
+            {
+                "batch": batch,
+                "samples": length,
+                "cold_cached_transform": cold_ms,
+                "wrapper_one_off": wrapper_ms,
+                "cached_transform": cached_ms,
+                "compiled_transform": compiled_ms,
+            }
+        )
+
+        if emit_markdown:
+            print(f"batch={batch} samples={length}")
+            print(f"  cold cached transform: {cold_ms:7.3f} ms")
+            print(f"  wrapper one-off:       {wrapper_ms:7.3f} ms")
+            print(f"  cached transform:      {cached_ms:7.3f} ms")
+            print(f"  compiled transform:    {compiled_ms:7.3f} ms")
+            print()
+
+    return {
+        "benchmark": "hybrid_cqt",
+        "meta": {
+            "warmup": warmup,
+            "iters": iters,
+            "quick": warmup <= 2 and iters <= 5,
+            "platform": platform.platform(),
+            "device": str(mx.default_device()),
+        },
+        "cases": rows,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="mlx-spectro hybrid CQT benchmarks")
+    parser.add_argument("--quick", action="store_true", help="use fewer warmup/iteration steps")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--json-out", type=str, help="write JSON results to a file")
+    args = parser.parse_args()
+
+    warmup = 2 if args.quick else 5
+    iters = 5 if args.quick else 20
+    payload = benchmark_hybrid_cqt(warmup=warmup, iters=iters, emit_markdown=not args.json)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import time
 from collections.abc import Iterable
 
@@ -166,7 +168,7 @@ def _print_table(title: str, cols: list[str], rows: list[dict]) -> None:
         print("| " + " | ".join(values) + " |")
 
 
-def benchmark_per_feature(*, warmup: int, iters: int) -> None:
+def benchmark_per_feature(*, warmup: int, iters: int, emit_markdown: bool = True) -> list[dict]:
     cols = ["eager", "compiled", "speedup"]
     rows: list[dict] = []
     for batch, length, n_fft, label in CONFIGS:
@@ -192,10 +194,12 @@ def benchmark_per_feature(*, warmup: int, iters: int) -> None:
                     "speedup": eager_ms / compiled_ms if compiled_ms > 0 else float("nan"),
                 }
             )
-    _print_table("Per-Feature Latency", cols, rows)
+    if emit_markdown:
+        _print_table("Per-Feature Latency", cols, rows)
+    return rows
 
 
-def benchmark_bundle(*, warmup: int, iters: int) -> None:
+def benchmark_bundle(*, warmup: int, iters: int, emit_markdown: bool = True) -> list[dict]:
     cols = [
         "sequential eager",
         "shared eager",
@@ -249,22 +253,45 @@ def benchmark_bundle(*, warmup: int, iters: int) -> None:
                 "reuse gain": seq_eager_ms / cached_eager_ms if cached_eager_ms > 0 else float("nan"),
             }
         )
-    _print_table("Shared-STFT Bundle", cols, rows)
+    if emit_markdown:
+        _print_table("Shared-STFT Bundle", cols, rows)
+    return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark spectral feature extraction paths")
     parser.add_argument("--quick", action="store_true", help="run fewer iterations")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--json-out", type=str, help="write JSON results to a file")
     args = parser.parse_args()
 
     warmup = 2 if args.quick else 5
     iters = 6 if args.quick else 20
 
-    print("## mlx-spectro feature benchmarks")
-    print(f"- warmup={warmup}")
-    print(f"- iters={iters}")
-    benchmark_per_feature(warmup=warmup, iters=iters)
-    benchmark_bundle(warmup=warmup, iters=iters)
+    if not args.json:
+        print("## mlx-spectro feature benchmarks")
+        print(f"- warmup={warmup}")
+        print(f"- iters={iters}")
+    per_feature = benchmark_per_feature(warmup=warmup, iters=iters, emit_markdown=not args.json)
+    bundle = benchmark_bundle(warmup=warmup, iters=iters, emit_markdown=not args.json)
+    payload = {
+        "benchmark": "features",
+        "meta": {
+            "warmup": warmup,
+            "iters": iters,
+            "quick": bool(args.quick),
+            "platform": platform.platform(),
+            "device": str(mx.default_device()),
+        },
+        "per_feature": per_feature,
+        "bundle": bundle,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
 
 if __name__ == "__main__":

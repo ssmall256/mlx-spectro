@@ -8,6 +8,7 @@ from typing import Literal, Optional, Union
 import mlx.core as mx
 
 __all__ = [
+    "RepeatedShapeCompileCache",
     "SpectralTransform",
     "MelSpectrogramTransform",
     "LogMelSpectrogramTransform",
@@ -73,6 +74,98 @@ MelMode = Literal["mlx_native", "torchaudio_compat", "default"]
 MelOutputScale = Literal["linear", "log", "db"]
 LogMelMode = Literal["clamp", "add", "log1p"]
 FilteredOutputScale = Literal["linear", "log", "db", "log10_plus_one"]
+
+
+class RepeatedShapeCompileCache:
+    """Promote repeated input shapes to bounded shape-specialized compiled callables.
+
+    This is intended for wrapper code that mostly sees variable-length audio but
+    still encounters a small repeated set of shapes in steady-state workloads.
+    The helper only manages shape hit counting and compiled-callable caching; the
+    caller still owns the eager fallback path.
+    """
+
+    __slots__ = (
+        "_compile_factory",
+        "_min_hits",
+        "_max_compiled_shapes",
+        "_max_pending_shapes",
+        "_pending_hits",
+        "_compiled",
+    )
+
+    def __init__(
+        self,
+        compile_factory,
+        *,
+        min_hits: int = 2,
+        max_compiled_shapes: int = 8,
+        max_pending_shapes: Optional[int] = None,
+    ) -> None:
+        if min_hits < 1:
+            raise ValueError("min_hits must be >= 1")
+        if max_compiled_shapes < 1:
+            raise ValueError("max_compiled_shapes must be >= 1")
+        if max_pending_shapes is None:
+            max_pending_shapes = max(16, max_compiled_shapes * 4)
+        if max_pending_shapes < 1:
+            raise ValueError("max_pending_shapes must be >= 1")
+
+        self._compile_factory = compile_factory
+        self._min_hits = int(min_hits)
+        self._max_compiled_shapes = int(max_compiled_shapes)
+        self._max_pending_shapes = int(max_pending_shapes)
+        self._pending_hits: OrderedDict[tuple[int, ...], int] = OrderedDict()
+        self._compiled: OrderedDict[tuple[int, ...], Any] = OrderedDict()
+
+    @staticmethod
+    def _normalize_shape(shape: Any) -> tuple[int, ...]:
+        if isinstance(shape, tuple):
+            return tuple(int(dim) for dim in shape)
+        return tuple(int(dim) for dim in tuple(shape))
+
+    def get(self, shape: Any):
+        shape_key = self._normalize_shape(shape)
+
+        cached = self._compiled.get(shape_key)
+        if cached is not None:
+            self._compiled.move_to_end(shape_key)
+            _record_cache_event("shape_compile_cache.hit", key=shape_key)
+            return cached
+
+        hits = self._pending_hits.get(shape_key, 0) + 1
+        self._pending_hits[shape_key] = hits
+        self._pending_hits.move_to_end(shape_key)
+        if len(self._pending_hits) > self._max_pending_shapes:
+            evicted_shape, _ = self._pending_hits.popitem(last=False)
+            _record_cache_event("shape_compile_cache.pending_evict", key=evicted_shape)
+
+        if hits < self._min_hits:
+            _record_cache_event("shape_compile_cache.miss", key=shape_key, detail=f"hits={hits}")
+            return None
+
+        compiled = self._compile_factory(shape_key)
+        if len(self._compiled) >= self._max_compiled_shapes:
+            evicted_shape, _ = self._compiled.popitem(last=False)
+            _record_cache_event("shape_compile_cache.compiled_evict", key=evicted_shape)
+        self._compiled[shape_key] = compiled
+        self._pending_hits.pop(shape_key, None)
+        _record_cache_event("shape_compile_cache.promote", key=shape_key)
+        return compiled
+
+    def clear(self) -> None:
+        self._pending_hits.clear()
+        self._compiled.clear()
+
+    def cache_info(self) -> dict[str, Any]:
+        return {
+            "min_hits": self._min_hits,
+            "max_compiled_shapes": self._max_compiled_shapes,
+            "max_pending_shapes": self._max_pending_shapes,
+            "pending_shapes": len(self._pending_hits),
+            "compiled_shapes": len(self._compiled),
+            "compiled_shape_keys": list(self._compiled.keys()),
+        }
 
 _CACHE_STATS_ENABLED = (
     os.environ.get("SPEC_MLX_CACHE_STATS", "0").lower()

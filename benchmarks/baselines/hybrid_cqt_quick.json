@@ -1,0 +1,36 @@
+{
+  "benchmark": "hybrid_cqt",
+  "cases": [
+    {
+      "batch": 1,
+      "cached_transform": 1.465875015128404,
+      "cold_cached_transform": 87.55616698181257,
+      "compiled_transform": 1.692500023636967,
+      "samples": 110250,
+      "wrapper_one_off": 1.873041968792677
+    },
+    {
+      "batch": 1,
+      "cached_transform": 2.722417004406452,
+      "cold_cached_transform": 5.6390000390820205,
+      "compiled_transform": 2.408625034149736,
+      "samples": 330750,
+      "wrapper_one_off": 2.919374965131283
+    },
+    {
+      "batch": 4,
+      "cached_transform": 2.3957499652169645,
+      "cold_cached_transform": 4.903417022433132,
+      "compiled_transform": 1.6959159984253347,
+      "samples": 110250,
+      "wrapper_one_off": 2.671708003617823
+    }
+  ],
+  "meta": {
+    "device": "Device(gpu, 0)",
+    "iters": 5,
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "quick": true,
+    "warmup": 2
+  }
+}

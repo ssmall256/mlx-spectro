@@ -1,6 +1,6 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 from .spectral_ops import (
     CenterPadMode,
@@ -15,6 +15,7 @@ from .spectral_ops import (
     MelOutputScale,
     MelScale,
     MelSpectrogramTransform,
+    RepeatedShapeCompileCache,
     LogMelMode,
     LogMelSpectrogramTransform,
     SpectralFeatureTransform,
@@ -49,6 +50,7 @@ from .spectral_ops import (
 
 __all__ = [
     "SpectralTransform",
+    "RepeatedShapeCompileCache",
     "MelSpectrogramTransform",
     "MFCCTransform",
     "SpectralFeatureTransform",

@@ -1,0 +1,68 @@
+{
+  "benchmark": "frontends",
+  "families": {
+    "FilteredSpectrogramTransform": [
+      {
+        "compiled": 0.32750004902482033,
+        "eager": 0.41612505447119474,
+        "label": "B=1 T=16k",
+        "speedup": 1.2706106631442298
+      },
+      {
+        "compiled": 0.44599996181204915,
+        "eager": 0.5106250173412263,
+        "label": "B=4 T=160k",
+        "speedup": 1.1448992400506328
+      }
+    ],
+    "LogMelSpectrogramTransform": [
+      {
+        "compiled": 0.4586669965647161,
+        "eager": 0.2567500341683626,
+        "label": "B=1 T=16k",
+        "speedup": 0.5597743811770773
+      },
+      {
+        "compiled": 0.8831250015646219,
+        "eager": 1.167957962024957,
+        "label": "B=4 T=160k",
+        "speedup": 1.3225284755337012
+      }
+    ],
+    "MFCCTransform": [
+      {
+        "compiled": 0.32125000143423676,
+        "eager": 0.3587499959394336,
+        "label": "B=1 T=16k",
+        "speedup": 1.1167314998841282
+      },
+      {
+        "compiled": 0.6842910079285502,
+        "eager": 1.0289589990861714,
+        "label": "B=4 T=160k",
+        "speedup": 1.50368627844604
+      }
+    ],
+    "MelSpectrogramTransform": [
+      {
+        "compiled": 0.30824996065348387,
+        "eager": 0.3607500111684203,
+        "label": "B=1 T=16k",
+        "speedup": 1.1703164873196978
+      },
+      {
+        "compiled": 1.1826669797301292,
+        "eager": 1.407375035341829,
+        "label": "B=4 T=160k",
+        "speedup": 1.1900011241228494
+      }
+    ]
+  },
+  "meta": {
+    "device": "Device(gpu, 0)",
+    "iters": 6,
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "quick": true,
+    "warmup": 2
+  }
+}

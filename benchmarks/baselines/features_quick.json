@@ -1,0 +1,149 @@
+{
+  "benchmark": "features",
+  "bundle": [
+    {
+      "cached compiled": 0.30262500513345003,
+      "cached eager": 0.39525004103779793,
+      "label": "B=1 T=16k nfft=512",
+      "reuse gain": 1.8522023331954904,
+      "sequential eager": 0.7320830482058227,
+      "shared compiled": 0.31408300856128335,
+      "shared eager": 0.601166975684464
+    },
+    {
+      "cached compiled": 0.8691250113770366,
+      "cached eager": 1.004124991595745,
+      "label": "B=4 T=160k nfft=1024",
+      "reuse gain": 1.7885392831934823,
+      "sequential eager": 1.7959169927053154,
+      "shared compiled": 0.831458019092679,
+      "shared eager": 1.0179170058108866
+    },
+    {
+      "cached compiled": 3.723457979504019,
+      "cached eager": 4.685375024564564,
+      "label": "B=8 T=480k nfft=1024",
+      "reuse gain": 2.0262962901766874,
+      "sequential eager": 9.493958030361682,
+      "shared compiled": 3.7804580060765147,
+      "shared eager": 4.707665997557342
+    }
+  ],
+  "meta": {
+    "device": "Device(gpu, 0)",
+    "iters": 6,
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "quick": true,
+    "warmup": 2
+  },
+  "per_feature": [
+    {
+      "compiled": 0.26074994821101427,
+      "eager": 0.28500001644715667,
+      "label": "B=1 T=16k nfft=512 spectral_centroid",
+      "speedup": 1.0930012389360777
+    },
+    {
+      "compiled": 0.27550000231713057,
+      "eager": 0.35491696326062083,
+      "label": "B=1 T=16k nfft=512 spectral_bandwidth",
+      "speedup": 1.2882648285863632
+    },
+    {
+      "compiled": 0.22724998416379094,
+      "eager": 0.3077919827774167,
+      "label": "B=1 T=16k nfft=512 spectral_rolloff",
+      "speedup": 1.3544202606217783
+    },
+    {
+      "compiled": 0.3219999489374459,
+      "eager": 0.4165410064160824,
+      "label": "B=1 T=16k nfft=512 spectral_contrast",
+      "speedup": 1.2936058151270164
+    },
+    {
+      "compiled": 0.26237498968839645,
+      "eager": 0.36091700894758105,
+      "label": "B=1 T=16k nfft=512 chroma_stft",
+      "speedup": 1.3755770295645013
+    },
+    {
+      "compiled": 0.32379099866375327,
+      "eager": 0.3717920044437051,
+      "label": "B=1 T=16k nfft=512 mfcc",
+      "speedup": 1.1482468814082116
+    },
+    {
+      "compiled": 0.5684579955413938,
+      "eager": 0.6637080223299563,
+      "label": "B=4 T=160k nfft=1024 spectral_centroid",
+      "speedup": 1.1675586015776722
+    },
+    {
+      "compiled": 1.1623340542428195,
+      "eager": 1.1947079910896719,
+      "label": "B=4 T=160k nfft=1024 spectral_bandwidth",
+      "speedup": 1.0278525237462321
+    },
+    {
+      "compiled": 0.5905830184929073,
+      "eager": 1.0714579839259386,
+      "label": "B=4 T=160k nfft=1024 spectral_rolloff",
+      "speedup": 1.8142377115077961
+    },
+    {
+      "compiled": 0.9394170483574271,
+      "eager": 1.2937920400872827,
+      "label": "B=4 T=160k nfft=1024 spectral_contrast",
+      "speedup": 1.377228614649352
+    },
+    {
+      "compiled": 0.43166696559637785,
+      "eager": 0.6498749717138708,
+      "label": "B=4 T=160k nfft=1024 chroma_stft",
+      "speedup": 1.5055008224129993
+    },
+    {
+      "compiled": 0.4065829562023282,
+      "eager": 0.5039169918745756,
+      "label": "B=4 T=160k nfft=1024 mfcc",
+      "speedup": 1.2393952677736226
+    },
+    {
+      "compiled": 1.1131669743917882,
+      "eager": 1.4749999972991645,
+      "label": "B=8 T=480k nfft=1024 spectral_centroid",
+      "speedup": 1.3250482912548447
+    },
+    {
+      "compiled": 1.401167013682425,
+      "eager": 2.2270000190474093,
+      "label": "B=8 T=480k nfft=1024 spectral_bandwidth",
+      "speedup": 1.5893894141816842
+    },
+    {
+      "compiled": 1.7709590028971434,
+      "eager": 1.8432079814374447,
+      "label": "B=8 T=480k nfft=1024 spectral_rolloff",
+      "speedup": 1.0407965279953448
+    },
+    {
+      "compiled": 2.1844999864697456,
+      "eager": 2.576958970166743,
+      "label": "B=8 T=480k nfft=1024 spectral_contrast",
+      "speedup": 1.1796562078863773
+    },
+    {
+      "compiled": 1.1491249897517264,
+      "eager": 2.0794160082004964,
+      "label": "B=8 T=480k nfft=1024 chroma_stft",
+      "speedup": 1.8095646920443038
+    },
+    {
+      "compiled": 1.6684579895809293,
+      "eager": 1.7269999952986836,
+      "label": "B=8 T=480k nfft=1024 mfcc",
+      "speedup": 1.0350874916140134
+    }
+  ]
+}

@@ -113,6 +113,37 @@ Compiled API contract:
 - For cached single-output transforms, the stable compiled entrypoint is `get_compiled()`. The returned callable should be invoked directly and should match the eager transform's logical output.
 - `SpectralTransform` is the explicit two-operation exception, so it keeps op-specific compiled helpers such as `get_compiled_stft()`, `get_compiled_istft()`, `compiled_pair()`, and `compiled_pair_nd()`.
 
+Choosing eager vs compiled:
+- Use eager transforms for one-shot inference and variable-length full-audio frontends.
+- Use `get_compiled()` when the same input shape repeats in a hot loop.
+- Use `RepeatedShapeCompileCache` when shapes vary overall but steady-state traffic reuses a small set of lengths.
+
+### `RepeatedShapeCompileCache`
+
+Small helper for wrapper code that wants to promote repeated shapes to compiled mode without making compilation the default for every input length.
+
+```python
+from mlx_spectro import LogMelSpectrogramTransform, RepeatedShapeCompileCache
+
+transform = LogMelSpectrogramTransform(...)
+shape_cache = RepeatedShapeCompileCache(
+    lambda shape: transform.get_compiled(),
+    min_hits=2,
+    max_compiled_shapes=8,
+)
+
+def frontend(x):
+    compiled = shape_cache.get(x.shape)
+    if compiled is not None:
+        return compiled(x)
+    return transform(x)
+```
+
+Notes:
+- The helper only manages shape hit counting and bounded compiled-callable caching.
+- The caller still owns the eager fallback path and any shape extraction policy.
+- This is intended for repeated-shape promotion, not as a replacement for `get_compiled()`.
+
 ### `SpectralTransform`
 
 Main class for STFT/iSTFT operations.
@@ -517,6 +548,8 @@ To reproduce:
 - Frontend eager vs compiled benchmarks: `python scripts/benchmark_frontends.py`
 - Feature extraction bundle benchmarks: `python scripts/benchmark_features.py`
 - Hybrid CQT benchmarks: `python scripts/benchmark_hybrid_cqt.py`
+- Machine-readable quick baselines: `python scripts/benchmark_frontends.py --quick --json`, `python scripts/benchmark_features.py --quick --json`, `python scripts/benchmark_hybrid_cqt.py --quick --json`
+- Quick regression check against checked-in baselines: `python scripts/check_benchmark_regressions.py`
 
 ### Real-world: mlx-audio-separator
 

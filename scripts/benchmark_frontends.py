@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import time
 
 import mlx.core as mx
@@ -66,11 +68,12 @@ def _simple_filterbank(n_freqs: int, n_bands: int = 32) -> np.ndarray:
     return fb
 
 
-def benchmark_frontends(*, warmup: int, iters: int) -> None:
-    print("## mlx-spectro frontend benchmarks")
-    print(f"- warmup={warmup}")
-    print(f"- iters={iters}")
-    print()
+def benchmark_frontends(*, warmup: int, iters: int, emit_markdown: bool = True) -> dict[str, object]:
+    if emit_markdown:
+        print("## mlx-spectro frontend benchmarks")
+        print(f"- warmup={warmup}")
+        print(f"- iters={iters}")
+        print()
 
     mel_rows = []
     logmel_rows = []
@@ -190,20 +193,45 @@ def benchmark_frontends(*, warmup: int, iters: int) -> None:
             }
         )
 
-    _print_table("MelSpectrogramTransform", mel_rows)
-    _print_table("LogMelSpectrogramTransform", logmel_rows)
-    _print_table("MFCCTransform", mfcc_rows)
-    _print_table("FilteredSpectrogramTransform", filtered_rows)
+    if emit_markdown:
+        _print_table("MelSpectrogramTransform", mel_rows)
+        _print_table("LogMelSpectrogramTransform", logmel_rows)
+        _print_table("MFCCTransform", mfcc_rows)
+        _print_table("FilteredSpectrogramTransform", filtered_rows)
+    return {
+        "benchmark": "frontends",
+        "meta": {
+            "warmup": warmup,
+            "iters": iters,
+            "quick": warmup <= 2 and iters <= 6,
+            "platform": platform.platform(),
+            "device": str(mx.default_device()),
+        },
+        "families": {
+            "MelSpectrogramTransform": mel_rows,
+            "LogMelSpectrogramTransform": logmel_rows,
+            "MFCCTransform": mfcc_rows,
+            "FilteredSpectrogramTransform": filtered_rows,
+        },
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--json-out", type=str, help="write JSON results to a file")
     args = parser.parse_args()
     if args.quick:
-        benchmark_frontends(warmup=2, iters=6)
+        payload = benchmark_frontends(warmup=2, iters=6, emit_markdown=not args.json)
     else:
-        benchmark_frontends(warmup=5, iters=20)
+        payload = benchmark_frontends(warmup=5, iters=20, emit_markdown=not args.json)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
 
 if __name__ == "__main__":
