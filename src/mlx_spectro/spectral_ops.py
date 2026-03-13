@@ -3300,6 +3300,7 @@ class MelSpectrogramTransform:
         "log_scale",
         "spectral",
         "mel_fb",
+        "_compiled_fns",
     )
 
     def __init__(
@@ -3382,6 +3383,7 @@ class MelSpectrogramTransform:
             norm=self.norm,
             mel_scale=self.mel_scale,
         )
+        self._compiled_fns = {}
 
     def _power_spectrogram_bnf(self, x: mx.array) -> mx.array:
         """Return power spectrogram in ``[B, N, F]`` layout (internal)."""
@@ -3475,6 +3477,25 @@ class MelSpectrogramTransform:
     ) -> mx.array:
         return self.mel_spectrogram(x, output_scale=output_scale, to_db=to_db)
 
+    def get_compiled(
+        self,
+        *,
+        output_scale: MelOutputScale | None = None,
+        to_db: bool | None = None,
+    ):
+        """Return a cached compiled mel callable for a fixed output contract."""
+        resolved = self._resolve_output_scale(output_scale=output_scale, to_db=to_db)
+        cached = self._compiled_fns.get(resolved)
+        if cached is not None:
+            return cached
+
+        @mx.compile
+        def _compiled(x: mx.array) -> mx.array:
+            return self.mel_spectrogram(x, output_scale=resolved)
+
+        self._compiled_fns[resolved] = _compiled
+        return _compiled
+
 
 class LogMelSpectrogramTransform(MelSpectrogramTransform):
     """Convenience wrapper for natural-log mel frontends."""
@@ -3494,6 +3515,10 @@ class LogMelSpectrogramTransform(MelSpectrogramTransform):
             log_scale=log_scale,
             **kwargs,
         )
+
+    def get_compiled(self):
+        """Return a cached compiled callable for the fixed log-mel contract."""
+        return super().get_compiled(output_scale="log")
 
 
 class FilteredSpectrogramTransform:
@@ -3518,6 +3543,7 @@ class FilteredSpectrogramTransform:
         "filterbank",
         "filterbank_n_freqs",
         "spectral",
+        "_compiled_fn",
     )
 
     def __init__(
@@ -3587,6 +3613,7 @@ class FilteredSpectrogramTransform:
             center_tail_pad=self.center_tail_pad,
             istft_backend_policy=None,
         )
+        self._compiled_fn = None
 
     def _filtered_linear(self, x: mx.array) -> tuple[mx.array, bool]:
         x_b, squeezed = _ensure_audio_batch(x, fn_name="filtered_spectrogram")
@@ -3648,6 +3675,19 @@ class FilteredSpectrogramTransform:
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.filtered_spectrogram(x)
+
+    def get_compiled(self):
+        """Return a cached compiled filtered-spectrogram callable."""
+        cached = self._compiled_fn
+        if cached is not None:
+            return cached
+
+        @mx.compile
+        def _compiled(x: mx.array) -> mx.array:
+            return self.filtered_spectrogram(x)
+
+        self._compiled_fn = _compiled
+        return _compiled
 
 
 def filtered_spectrogram(
@@ -4036,6 +4076,7 @@ class MFCCTransform:
         "dct_mat",
         "_dct_mat_t",
         "_lifter_weights",
+        "_compiled_fn",
     )
 
     def __init__(
@@ -4114,6 +4155,7 @@ class MFCCTransform:
             self._lifter_weights = _cached_lifter_weights(self.n_mfcc, self.lifter)
         else:
             self._lifter_weights = None
+        self._compiled_fn = None
 
     def mfcc(self, x: mx.array) -> mx.array:
         """Compute MFCCs, returning ``[B, n_mfcc, frames]`` or ``[n_mfcc, frames]``."""
@@ -4135,6 +4177,19 @@ class MFCCTransform:
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.mfcc(x)
+
+    def get_compiled(self):
+        """Return a cached compiled MFCC callable for fixed-shape hot loops."""
+        cached = self._compiled_fn
+        if cached is not None:
+            return cached
+
+        @mx.compile
+        def _compiled(x: mx.array) -> mx.array:
+            return self.mfcc(x)
+
+        self._compiled_fn = _compiled
+        return _compiled
 
 
 def mfcc(

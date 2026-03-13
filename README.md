@@ -229,6 +229,7 @@ MelSpectrogramTransform(
 **Methods:**
 - `spectrogram(x)` — Returns power or magnitude spectrogram `[B, F, N]`.
 - `mel_spectrogram(x, output_scale=None, to_db=None)` / `__call__(x, output_scale=None, to_db=None)` — Returns `[B, n_mels, N]`.
+- `get_compiled(output_scale=None, to_db=None)` — Return a cached compiled callable for a fixed mel output contract. Use this when shape and output mode are stable across calls.
 
 **Mode semantics:**
 - `mode="mlx_native"`: per-example `top_db` clipping (batch-independent behavior).
@@ -247,7 +248,7 @@ MelSpectrogramTransform(
 
 ### `LogMelSpectrogramTransform`
 
-Convenience wrapper for natural-log mel frontends. It is equivalent to `MelSpectrogramTransform(..., output_scale="log", ...)` and is intended for AMT/ASR-style pipelines that want log-mel directly instead of dB output.
+Convenience wrapper for natural-log mel frontends. It is equivalent to `MelSpectrogramTransform(..., output_scale="log", ...)` and is intended for AMT/ASR-style pipelines that want log-mel directly instead of dB output. Its `get_compiled()` method is fixed to the log-mel contract and does not expose output-mode overrides.
 
 ### Feature Extraction
 
@@ -278,6 +279,7 @@ FilteredSpectrogramTransform(
 
 **Methods:**
 - `filtered_spectrogram(x)` / `__call__(x)` — Returns `[n_bands, frames]` for 1-D input or `[B, n_bands, frames]` for batched input.
+- `get_compiled()` — Return a cached compiled callable for fixed-shape hot loops.
 
 This is the reusable path for project-specific frontends that apply non-mel filterbanks after one STFT magnitude pass, such as beat/chord/log-frequency pipelines.
 
@@ -346,6 +348,7 @@ MFCCTransform(
 
 **Methods:**
 - `mfcc(x)` / `__call__(x)` — Returns MFCCs `[n_mfcc, frames]` for 1-D input or `[B, n_mfcc, frames]` for batched input.
+- `get_compiled()` — Return a cached compiled callable for fixed-shape hot loops.
 
 MFCC uses librosa-style mel defaults (`norm="slaney"`, `mel_scale="slaney"`) while reusing this package's explicit STFT padding controls.
 
@@ -511,6 +514,7 @@ Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
 To reproduce:
 - Full suite: `python scripts/benchmark.py`
 - Dispatch overhead profile: `python scripts/benchmark.py --dispatch-profile`
+- Frontend eager vs compiled benchmarks: `python scripts/benchmark_frontends.py`
 - Feature extraction bundle benchmarks: `python scripts/benchmark_features.py`
 - Hybrid CQT benchmarks: `python scripts/benchmark_hybrid_cqt.py`
 

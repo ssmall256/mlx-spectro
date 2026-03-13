@@ -170,6 +170,34 @@ def test_filtered_spectrogram_accepts_no_nyquist_filterbank():
     assert out.shape[0] == 8
 
 
+def test_filtered_spectrogram_get_compiled_matches_eager():
+    x = mx.array(_audio(seed=12))
+    fb = _simple_filterbank(257, 8)
+    tr = FilteredSpectrogramTransform(
+        filterbank=fb,
+        n_fft=512,
+        hop_length=128,
+        power=1.0,
+        output_scale="log10_plus_one",
+        periodic=False,
+        center=True,
+        center_pad_mode="constant",
+        center_tail_pad="minimal",
+    )
+    compiled = tr.get_compiled()
+    eager = tr(x)
+    compiled_out = compiled(x)
+    np.testing.assert_allclose(_to_numpy(eager), _to_numpy(compiled_out), rtol=1e-5, atol=1e-5)
+
+
+def test_filtered_spectrogram_get_compiled_is_cached():
+    fb = _simple_filterbank(257, 8)
+    tr = FilteredSpectrogramTransform(filterbank=fb, n_fft=512, hop_length=128)
+    compiled1 = tr.get_compiled()
+    compiled2 = tr.get_compiled()
+    assert compiled1 is compiled2
+
+
 def test_log_triangular_fbanks_matches_reference():
     got = _to_numpy(
         log_triangular_fbanks(

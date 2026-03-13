@@ -248,3 +248,32 @@ def test_mfcc_transform_compile_smoke():
     compiled_out = compiled(x)
     mx.eval(eager, compiled_out)
     np.testing.assert_allclose(_to_numpy(eager), _to_numpy(compiled_out), rtol=1e-5, atol=1e-5)
+
+
+def test_mfcc_transform_get_compiled_matches_eager():
+    tr = MFCCTransform(
+        sample_rate=24_000,
+        n_mfcc=13,
+        n_fft=1024,
+        hop_length=240,
+        n_mels=40,
+    )
+    x = mx.array(_audio(24_000, seed=71))
+    compiled = tr.get_compiled()
+    eager = tr(x)
+    compiled_out = compiled(x)
+    mx.eval(eager, compiled_out)
+    np.testing.assert_allclose(_to_numpy(eager), _to_numpy(compiled_out), rtol=1e-5, atol=1e-5)
+
+
+def test_mfcc_transform_get_compiled_is_cached():
+    tr = MFCCTransform(
+        sample_rate=24_000,
+        n_mfcc=13,
+        n_fft=1024,
+        hop_length=240,
+        n_mels=40,
+    )
+    compiled1 = tr.get_compiled()
+    compiled2 = tr.get_compiled()
+    assert compiled1 is compiled2

@@ -239,6 +239,73 @@ def test_log_mel_add_matches_linear_postprocess():
     np.testing.assert_allclose(logged, ref, rtol=1e-6, atol=1e-6)
 
 
+def test_mel_spectrogram_get_compiled_matches_eager_default_output():
+    rng = np.random.default_rng(31)
+    audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
+    transform = MelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=128,
+        power=2.0,
+        norm="slaney",
+        mel_scale="slaney",
+        top_db=80.0,
+        output_scale="db",
+        center=True,
+        center_pad_mode="constant",
+    )
+    audio = mx.array(audio_np)
+    compiled = transform.get_compiled()
+    eager = transform(audio)
+    compiled_out = compiled(audio)
+    mx.eval(eager, compiled_out)
+    np.testing.assert_allclose(_to_numpy(eager), _to_numpy(compiled_out), rtol=1e-5, atol=1e-5)
+
+
+def test_mel_spectrogram_get_compiled_caches_by_resolved_output_scale():
+    transform = MelSpectrogramTransform(output_scale="db")
+    compiled_linear = transform.get_compiled(output_scale="linear")
+    compiled_linear_alias = transform.get_compiled(to_db=False)
+    compiled_db = transform.get_compiled()
+    compiled_db_alias = transform.get_compiled(to_db=True)
+    assert compiled_linear is compiled_linear_alias
+    assert compiled_db is compiled_db_alias
+    assert compiled_linear is not compiled_db
+
+
+def test_log_mel_get_compiled_matches_eager():
+    rng = np.random.default_rng(41)
+    audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
+    transform = LogMelSpectrogramTransform(
+        sample_rate=16_000,
+        n_fft=2_048,
+        hop_length=512,
+        n_mels=256,
+        f_min=30.0,
+        f_max=8_000.0,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk",
+        center=True,
+        center_pad_mode="constant",
+        log_amin=1e-5,
+        log_mode="clamp",
+    )
+    audio = mx.array(audio_np)
+    compiled = transform.get_compiled()
+    eager = transform(audio)
+    compiled_out = compiled(audio)
+    mx.eval(eager, compiled_out)
+    np.testing.assert_allclose(_to_numpy(eager), _to_numpy(compiled_out), rtol=1e-5, atol=1e-5)
+
+
+def test_log_mel_get_compiled_is_log_only():
+    transform = LogMelSpectrogramTransform()
+    with pytest.raises(TypeError):
+        transform.get_compiled(output_scale="db")
+
+
 def test_log_mel_log1p_matches_linear_postprocess():
     rng = np.random.default_rng(19)
     audio_np = rng.standard_normal((2, 8_000), dtype=np.float32) * 0.2
