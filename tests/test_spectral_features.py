@@ -301,45 +301,33 @@ def test_spectral_feature_transform_reuses_cached_state_across_instances():
     assert tr1.dct_mat is tr2.dct_mat
 
 
-def test_spectral_feature_transform_compile_smoke():
+def test_spectral_feature_transform_get_compiled_matches_extract():
     tr = SpectralFeatureTransform(include=("spectral_centroid", "mfcc"))
     x = mx.array(_audio(seed=8))
-    compiled = tr.get_compiled_values()
+    compiled = tr.get_compiled()
 
     eager = tr(x)
-    compiled_centroid, compiled_mfcc = compiled(x)
+    compiled_out = compiled(x)
     mx.eval(
         eager["spectral_centroid"],
         eager["mfcc"],
-        compiled_centroid,
-        compiled_mfcc,
+        compiled_out["spectral_centroid"],
+        compiled_out["mfcc"],
     )
-    np.testing.assert_allclose(
-        _to_numpy(eager["spectral_centroid"]),
-        _to_numpy(compiled_centroid),
-        atol=1e-5,
-        rtol=1e-5,
-    )
-    np.testing.assert_allclose(
-        _to_numpy(eager["mfcc"]),
-        _to_numpy(compiled_mfcc),
-        atol=1e-5,
-        rtol=1e-5,
-    )
-
-
-def test_spectral_feature_transform_extract_compiled_matches_extract():
-    tr = SpectralFeatureTransform(include=("spectral_centroid", "spectral_contrast", "mfcc"))
-    x = mx.array(_audio(seed=18))
-    eager = tr(x)
-    compiled = tr.extract_compiled(x)
     for key in tr.include:
         np.testing.assert_allclose(
             _to_numpy(eager[key]),
-            _to_numpy(compiled[key]),
+            _to_numpy(compiled_out[key]),
             atol=1e-5,
             rtol=1e-5,
         )
+
+
+def test_spectral_feature_transform_get_compiled_is_cached():
+    tr = SpectralFeatureTransform(include=("spectral_centroid", "spectral_contrast", "mfcc"))
+    compiled1 = tr.get_compiled()
+    compiled2 = tr.get_compiled()
+    assert compiled1 is compiled2
 
 
 def test_rms_zero_signal():

@@ -3961,10 +3961,6 @@ class HybridCQTTransform:
         self._compiled_fn = _compiled
         return _compiled
 
-    def hybrid_cqt_compiled(self, x: mx.array) -> mx.array:
-        """Execute hybrid CQT via a cached compiled callable."""
-        return self.get_compiled()(x)
-
 
 @lru_cache(maxsize=64)
 def _cached_hybrid_cqt_transform(
@@ -5225,6 +5221,7 @@ class SpectralFeatureTransform:
         "_lifter_weights",
         "_short_spectral",
         "_contrast_bands",
+        "_compiled_fn",
         "_compiled_values_fn",
     )
 
@@ -5340,6 +5337,7 @@ class SpectralFeatureTransform:
         self.dct_mat = None
         self._dct_mat_t = None
         self._lifter_weights = None
+        self._compiled_fn = None
         self._compiled_values_fn = None
 
         if "chroma_stft" in self.include:
@@ -5445,8 +5443,8 @@ class SpectralFeatureTransform:
     def __call__(self, x: mx.array) -> OrderedDict[str, mx.array]:
         return self.extract(x)
 
-    def get_compiled_values(self):
-        """Return a cached compiled callable yielding values in ``include`` order."""
+    def _get_compiled_values(self):
+        """Return cached compiled raw values in ``include`` order."""
         cached = self._compiled_values_fn
         if cached is not None:
             return cached
@@ -5459,10 +5457,20 @@ class SpectralFeatureTransform:
         self._compiled_values_fn = _compiled
         return _compiled
 
-    def extract_compiled(self, x: mx.array) -> OrderedDict[str, mx.array]:
-        """Execute feature extraction via a cached compiled callable."""
-        values = self.get_compiled_values()(x)
-        return OrderedDict((name, value) for name, value in zip(self.include, values))
+    def get_compiled(self):
+        """Return a cached compiled callable matching :meth:`extract` output."""
+        cached = self._compiled_fn
+        if cached is not None:
+            return cached
+
+        values_fn = self._get_compiled_values()
+
+        def _compiled(x: mx.array) -> OrderedDict[str, mx.array]:
+            values = values_fn(x)
+            return OrderedDict((name, value) for name, value in zip(self.include, values))
+
+        self._compiled_fn = _compiled
+        return _compiled
 
 
 def spectral_centroid(

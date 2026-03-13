@@ -109,6 +109,10 @@ The public API is grouped into six main areas:
 - Hybrid CQT
 - Advanced helpers, diagnostics, and typing aliases
 
+Compiled API contract:
+- For cached single-output transforms, the stable compiled entrypoint is `get_compiled()`. The returned callable should be invoked directly and should match the eager transform's logical output.
+- `SpectralTransform` is the explicit two-operation exception, so it keeps op-specific compiled helpers such as `get_compiled_stft()`, `get_compiled_istft()`, `compiled_pair()`, and `compiled_pair_nd()`.
+
 ### `SpectralTransform`
 
 Main class for STFT/iSTFT operations.
@@ -306,6 +310,7 @@ HybridCQTTransform(
 
 **Methods:**
 - `hybrid_cqt(x)` / `__call__(x)` — Returns `[n_bins, frames]` for 1-D input or `[B, n_bins, frames]` for batched input.
+- `get_compiled()` — Return a cached compiled callable for fixed-shape hot loops. Call it as `compiled = transform.get_compiled(); y = compiled(x)`.
 
 Hybrid CQT basis construction is implemented directly in-package and cached at init time. Repeated calls stay on MLX tensors; no extra package dependencies are required beyond `numpy`.
 
@@ -374,6 +379,7 @@ Cached reusable version of `spectral_features(...)` for repeated-call workloads.
 
 **Methods:**
 - `extract(x)` / `__call__(x)` — Returns the same ordered mapping as `spectral_features(...)`, but reuses cached frontend state.
+- `get_compiled()` — Return a cached compiled callable for fixed-shape hot loops. The compiled callable returns the same ordered mapping as `extract(x)`.
 
 ### `spectral_centroid(x, *, sample_rate=22050, n_fft=2048, hop_length=512, win_length=None, ...)`
 

@@ -227,9 +227,9 @@ def benchmark_bundle(*, warmup: int, iters: int) -> None:
         def cached_call(x=x, tr=cached_transform):
             return tr(x)
 
-        compiled_values = cached_transform.get_compiled_values()
+        compiled = cached_transform.get_compiled()
 
-        def cached_compiled_call(x=x, fn=compiled_values):
+        def cached_compiled_call(x=x, fn=compiled):
             return fn(x)
 
         shared_compiled = mx.compile(shared_compiled_call)
