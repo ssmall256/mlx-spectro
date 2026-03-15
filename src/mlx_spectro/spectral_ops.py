@@ -391,6 +391,9 @@ int k_min = 0;
 # Type-polymorphic template; float32 accumulation, cast to T on output.
 # Dynamic lengths (n_frames, out_len) are passed via `params` buffer to avoid
 # kernel recompilation for every unique audio length.
+# UNROLL_K is a compile-time template constant = min(FRAME/HOP, 8), matching
+# the overlap ratio so the compiler can fully unroll common cases (e.g. 4 for
+# standard 4× overlap, 8 for high-overlap configs).
 _METAL_OLA_TEMPLATE = """
 int n_frames = params[0];
 int out_len = params[1];
@@ -401,7 +404,7 @@ if (st >= out_len) return;
 float acc = 0.0f;
 int base_offset = sb * n_frames * FRAME;
 
-#pragma unroll 4
+#pragma unroll UNROLL_K
 for (int k = k_max; k >= k_min; --k) {
     int off = st - k * HOP;
     acc += (float)frames[base_offset + k * FRAME + off] * (float)window[off];
@@ -423,7 +426,7 @@ float acc = 0.0f;
 float den = 0.0f;
 int base_offset = sb * n_frames * FRAME;
 
-#pragma unroll 4
+#pragma unroll UNROLL_K
 for (int k = k_max; k >= k_min; --k) {
     int off = st - k * HOP;
     acc += (float)frames[base_offset + k * FRAME + off] * (float)window[off];
@@ -446,7 +449,7 @@ if (st >= out_len) return;
 """ + _METAL_K_BOUNDS + """
 float den = 0.0f;
 
-#pragma unroll 4
+#pragma unroll UNROLL_K
 for (int k = k_min; k <= k_max; ++k) {
     int off = st - k * HOP;
     den += (float)window_sq[off];
@@ -648,9 +651,12 @@ out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)grad_val;
 
 
 # Minimum output bytes (B * n_frames * n_fft * 4) before using the tiled kernel.
-# Below this threshold the workload is latency-bound and tiling adds no benefit.
-# Benchmarked on M4 Max: tiled wins consistently above ~100 MB, is neutral at
-# ~60 MB, and can regress below that.  100 MB is a safe crossover point.
+# Below this threshold the autotuned simple kernel is faster or equivalent.
+# Re-validated on M4 Max across 186 real-world consumer configs (20 projects,
+# metalq-serialized): tiled wins 77% above 100 MB (avg 1.11x), only 14-44%
+# below.  The advantage grows to 1.22x above 500 MB.  100 MB remains the
+# optimal crossover point even after adding threadgroup autotuning to the
+# simple kernel.
 _TILED_FRAME_EXTRACT_BYTE_THRESHOLD = 100_000_000  # ~100 MB
 
 # --- 7) Metal Kernel: Fused power spectrum ---
@@ -1232,7 +1238,8 @@ def _run_metal_ola(
     window = mx.contiguous(window)
 
     params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
-    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame)]
+    unroll_k = min(frame // hop, 8) if hop > 0 else 1
+    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("UNROLL_K", unroll_k)]
     _record_tmpl_event("ola", tmpl)
 
     tgx = _KernelCache.autotune_threadgroup_x(
@@ -1338,7 +1345,8 @@ def _run_metal_ola_norm(
     window_sq = mx.contiguous(window_sq)
 
     params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
-    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame)]
+    unroll_k = min(frame // hop, 8) if hop > 0 else 1
+    tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("UNROLL_K", unroll_k)]
     _record_tmpl_event("ola_norm", tmpl)
 
     tgx = _KernelCache.autotune_threadgroup_x(
@@ -2717,7 +2725,8 @@ class SpectralTransform:
             envelope_kernel = _KernelCache.get_envelope()
             if envelope_kernel and envelope_kernel is not False:
                 env_params = mx.array([n_frames_int, out_len], dtype=mx.int32)
-                env_tmpl = [("T", mx.float32), ("HOP", hop_length), ("FRAME", n_fft)]
+                env_unroll_k = min(n_fft // hop_length, 8) if hop_length > 0 else 1
+                env_tmpl = [("T", mx.float32), ("HOP", hop_length), ("FRAME", n_fft), ("UNROLL_K", env_unroll_k)]
                 env_grid = (out_len, 1, 1)
                 env_tgx = _KernelCache.autotune_threadgroup_x(
                     kernel=envelope_kernel,
@@ -2869,9 +2878,10 @@ class SpectralTransform:
             return denom, denom_inv
             
         params = mx.array([int(n_frames), int(out_len)], dtype=mx.int32)
+        env_unroll_k = min(self.n_fft // self.hop_length, 8) if self.hop_length > 0 else 1
         tmpl = [
             ("T", window_sq.dtype), ("HOP", self.hop_length),
-            ("FRAME", self.n_fft),
+            ("FRAME", self.n_fft), ("UNROLL_K", env_unroll_k),
         ]
         _record_tmpl_event("envelope", tmpl)
 
@@ -2983,13 +2993,26 @@ class SpectralTransform:
                         ("T", x.dtype), ("NFFT", self.n_fft),
                         ("HOP", self.hop_length), ("PAD", pad),
                     ]
+                    fe_grid = (self.n_fft, n_frames, B)
+                    fe_tgx = _KernelCache.autotune_threadgroup_x(
+                        kernel=kernel,
+                        kernel_name=f"fused_frame_extract_{x.dtype}",
+                        n_fft=self.n_fft,
+                        hop=self.hop_length,
+                        grid=fe_grid,
+                        inputs=[x, self.window, fe_params],
+                        template=tmpl,
+                        output_shape=(B, n_frames, self.n_fft),
+                        output_dtype=x.dtype,
+                        default_tgx=min(256, self.n_fft),
+                    )
                     outputs = kernel(
                         inputs=[x, self.window, fe_params],
                         template=tmpl,
                         output_shapes=[(B, n_frames, self.n_fft)],
                         output_dtypes=[x.dtype],
-                        grid=(self.n_fft, n_frames, B),
-                        threadgroup=(min(256, self.n_fft), 1, 1),
+                        grid=fe_grid,
+                        threadgroup=(fe_tgx, 1, 1),
                     )
                 else:
                     outputs = None
@@ -3065,12 +3088,10 @@ class SpectralTransform:
 
         long_mode_strategy:
           - "native": always use MLX FFT for iFFT (fastest path).
-          - "numpy_fallback": for center=True and extended-length requests
-            (length > trimmed_length), use NumPy iFFT to reduce cross-framework
-            numerical drift in long-mode tails.
-          - "torch_fallback": for targeted center=True extended-length requests,
-            run torch.istft for strict parity while keeping native MLX path for
-            all other cases.
+          - "numpy_fallback": **deprecated** — originally reduced cross-framework
+            numerical drift, but MLX's irfft now matches NumPy/Torch within
+            float32 noise.  Will be removed in a future release.
+          - "torch_fallback": **deprecated** — same rationale as numpy_fallback.
         backend_policy:
           - "auto": use legacy routing rules from long_mode_strategy.
           - "mlx_fft": force MLX iFFT path (no NumPy/Torch fallback route).
@@ -3081,6 +3102,14 @@ class SpectralTransform:
             raise ValueError(
                 "long_mode_strategy must be one of "
                 "{'native', 'numpy_fallback', 'torch_fallback'}"
+            )
+        if long_mode_strategy != "native":
+            warnings.warn(
+                f"long_mode_strategy='{long_mode_strategy}' is deprecated and will "
+                "be removed in a future release. MLX's irfft now matches NumPy/Torch "
+                "within float32 noise; use long_mode_strategy='native' instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         resolved_backend = _resolve_backend_policy(
             backend_policy,
@@ -3137,6 +3166,13 @@ class SpectralTransform:
         is_long_request = (length is not None) and (int(length) > int(trimmed_length))
 
         if resolved_backend == "torch_fallback":
+            warnings.warn(
+                "backend_policy='torch_fallback' is deprecated and will be removed "
+                "in a future release. MLX's irfft now matches Torch within float32 "
+                "noise; use backend_policy='auto' or 'mlx_fft' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             if z_bfn is None:
                 z_bfn = z.transpose(0, 2, 1)
             out_torch = self._istft_torch_fallback(z_bfn, length=length)
