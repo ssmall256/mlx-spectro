@@ -4101,7 +4101,7 @@ def filtered_transform_from_filterbank(
     center_tail_pad: CenterTailPad = "minimal",
 ) -> FilteredSpectrogramTransform:
     return FilteredSpectrogramTransform(
-        filterbank=np.ascontiguousarray(np.asarray(filterbank, dtype=np.float32), dtype=np.float32),
+        filterbank=np.ascontiguousarray(filterbank, dtype=np.float32),
         sample_rate=sample_rate,
         n_fft=frame_size,
         hop_length=hop_size,
@@ -4136,7 +4136,7 @@ def cached_log_filterbank(
         norm_filters=norm_filters,
         include_nyquist=False,
     )
-    return np.ascontiguousarray(np.asarray(filterbank, dtype=np.float32), dtype=np.float32)
+    return np.ascontiguousarray(filterbank, dtype=np.float32)
 
 
 @lru_cache(maxsize=16)
@@ -4158,7 +4158,7 @@ def cached_mel_filterbank(
         fmax=fmax,
         norm_filters=norm_filters,
     )
-    return np.ascontiguousarray(np.asarray(filterbank, dtype=np.float32), dtype=np.float32)
+    return np.ascontiguousarray(filterbank, dtype=np.float32)
 
 
 @lru_cache(maxsize=16)
@@ -4190,6 +4190,11 @@ def cached_filtered_transform(
 def _prepare_waveform_array(waveform: np.ndarray | mx.array) -> mx.array:
     if isinstance(waveform, mx.array):
         data = waveform
+        if data.ndim > 1:
+            data = mx.mean(data, axis=-1)
+        if data.dtype != mx.float32:
+            data = data.astype(mx.float32)
+        return data
     else:
         data_np = np.asarray(waveform)
         if data_np.ndim > 1:
@@ -4236,7 +4241,7 @@ def compute_filtered_spectrogram(
     spec = mx.transpose(transform(audio), (1, 0))
     mx.eval(spec)
     return FilteredSpectrogramResult(
-        spectrogram=np.ascontiguousarray(np.asarray(spec, dtype=np.float32), dtype=np.float32),
+        spectrogram=np.ascontiguousarray(spec, dtype=np.float32),
         filterbank=filterbank,
     )
 
@@ -4308,7 +4313,7 @@ def compute_filtered_spectrogram_at_starts(
     )
     mx.eval(spec)
     return FilteredSpectrogramResult(
-        spectrogram=np.ascontiguousarray(np.asarray(spec, dtype=np.float32), dtype=np.float32),
+        spectrogram=np.ascontiguousarray(spec, dtype=np.float32),
         filterbank=filterbank,
     )
 
@@ -4355,16 +4360,39 @@ def compute_filtered_spectrogram_at_fps(
     )
     mx.eval(spec)
     return FilteredSpectrogramResult(
-        spectrogram=np.ascontiguousarray(np.asarray(spec, dtype=np.float32), dtype=np.float32),
+        spectrogram=np.ascontiguousarray(spec, dtype=np.float32),
         filterbank=filterbank,
     )
 
 
 def compute_log_filtered_spectrogram(
     waveform: np.ndarray | mx.array,
-    **kwargs,
+    *,
+    frame_size: int,
+    hop_size: int,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    num_bands: int,
+    fmin: float = DEFAULT_FMIN,
+    fmax: float = DEFAULT_FMAX,
+    norm_filters: bool = True,
+    log_amin: float = 1e-5,
+    log_mode: LogMelMode = "clamp",
+    center_tail_pad: CenterTailPad = "minimal",
 ) -> FilteredSpectrogramResult:
-    return compute_filtered_spectrogram(waveform, **kwargs)
+    return compute_filtered_spectrogram(
+        waveform,
+        frame_size=frame_size,
+        hop_size=hop_size,
+        sample_rate=sample_rate,
+        num_bands=num_bands,
+        fmin=fmin,
+        fmax=fmax,
+        norm_filters=norm_filters,
+        output_scale="log",
+        log_amin=log_amin,
+        log_mode=log_mode,
+        center_tail_pad=center_tail_pad,
+    )
 
 
 def compute_mel_spectrogram(
@@ -4404,7 +4432,7 @@ def compute_mel_spectrogram(
     spec = mx.transpose(transform(audio), (1, 0))
     mx.eval(spec)
     return FilteredSpectrogramResult(
-        spectrogram=np.ascontiguousarray(np.asarray(spec, dtype=np.float32), dtype=np.float32),
+        spectrogram=np.ascontiguousarray(spec, dtype=np.float32),
         filterbank=filterbank,
     )
 
@@ -4447,6 +4475,30 @@ def compute_mel_spectrogram_mlx(
     return spec, filterbank
 
 
+_LOG10_E = np.float32(1.0 / np.log(10.0))
+
+_LOG_FN_DISPATCH: dict[str, object] = {
+    "log": np.log,
+    "log10": np.log10,
+}
+
+
+def _resolve_log_fn_name(log_fn) -> str | None:
+    if log_fn is None:
+        return None
+    if isinstance(log_fn, str):
+        if log_fn not in _LOG_FN_DISPATCH:
+            raise ValueError(f"Unsupported log_fn string: {log_fn!r} (expected 'log' or 'log10')")
+        return log_fn
+    if log_fn is np.log or getattr(log_fn, "__name__", None) == "log":
+        return "log"
+    if log_fn is np.log10 or getattr(log_fn, "__name__", None) == "log10":
+        return "log10"
+    raise ValueError(
+        f"Unsupported log_fn: {log_fn!r}. Pass 'log', 'log10', np.log, np.log10, or None."
+    )
+
+
 def _logarithmic_spectrogram_mlx(
     spec: mx.array,
     *,
@@ -4459,13 +4511,12 @@ def _logarithmic_spectrogram_mlx(
         x = x * float(mul)
     if add is not None:
         x = x + float(add)
-    if log_fn is None:
+    name = _resolve_log_fn_name(log_fn)
+    if name is None:
         return x
-    if log_fn is np.log:
+    if name == "log":
         return mx.log(x)
-    if log_fn is np.log10:
-        return mx.log(x) / np.float32(np.log(10.0))
-    raise ValueError(f"Unsupported MLX log_fn: {log_fn}")
+    return mx.log(x) * _LOG10_E
 
 
 def _repeat_pad_frames_mlx(
@@ -4602,7 +4653,7 @@ def trim_to_shortest(
         slices = [slice(None)] * array.ndim
         slices[axis] = slice(0, min_len)
         trimmed.append(
-            np.ascontiguousarray(np.asarray(array[tuple(slices)], dtype=np.float32), dtype=np.float32)
+            np.ascontiguousarray(array[tuple(slices)], dtype=np.float32)
         )
     return trimmed
 
@@ -5043,11 +5094,11 @@ def stft_features_at_fps(
 def diff_frames_from_hann(
     *,
     frame_size: int,
-    hop_size: int,
+    hop_size: float,
     diff_ratio: float = 0.5,
 ) -> int:
     frame_size = int(frame_size)
-    hop_size = int(hop_size)
+    hop_size = float(hop_size)
     diff_ratio = float(diff_ratio)
     if frame_size <= 0:
         raise ValueError("frame_size must be > 0")
@@ -5061,28 +5112,7 @@ def diff_frames_from_hann(
     return int(max(1, round(diff_samples / hop_size)))
 
 
-def _spectral_diff_numpy(
-    spec: np.ndarray,
-    *,
-    diff_frames: int,
-    diff_max_bins: int | None = None,
-    positive_diffs: bool = True,
-) -> np.ndarray:
-    diff = np.zeros_like(spec, dtype=np.float32)
-    if diff_max_bins is None:
-        diff[diff_frames:] = spec[diff_frames:] - spec[:-diff_frames]
-    else:
-        padded = np.pad(
-            spec[:-diff_frames],
-            ((0, 0), (diff_max_bins // 2, diff_max_bins - 1 - diff_max_bins // 2)),
-            mode="reflect",
-        )
-        windows = np.lib.stride_tricks.sliding_window_view(padded, diff_max_bins, axis=1)
-        ref = windows.max(axis=-1)
-        diff[diff_frames:] = spec[diff_frames:] - ref
-    if positive_diffs:
-        diff = np.maximum(diff, 0.0)
-    return diff.astype(np.float32)
+_spectral_diff_numpy = positive_spectral_diff_numpy
 
 
 def phase_deviation(phase: np.ndarray) -> np.ndarray:
@@ -5265,7 +5295,6 @@ def spectral_odf(
     add: float = 1.0,
     diff_ratio: float = 0.5,
     diff_max_bins: int | None = None,
-    positive_diffs: bool = False,
     circular_shift: bool | None = None,
     temporal_filter: int = 3,
     temporal_origin: int = 0,
@@ -5274,7 +5303,6 @@ def spectral_odf(
     end: FramingEnd | None = None,
     preset: Literal["madmom_offline", "madmom_online", "madmom_superflux"] | None = None,
 ) -> np.ndarray:
-    del positive_diffs
     origin_value, end_value = _resolve_spectral_odf_preset(preset, origin=origin, end=end)
     if circular_shift is None:
         circular_shift = any(tag in onset_method for tag in ("phase", "complex"))
@@ -6081,24 +6109,6 @@ def logarithmic_spectrogram(
     return out
 
 
-def _frame_origin(frame_size: int, origin: str | int) -> int:
-    if origin in ("center", "offline"):
-        return 0
-    if origin in ("left", "past", "online"):
-        return int((frame_size - 1) / 2)
-    if origin in ("right", "future", "stream"):
-        return int(-(frame_size / 2))
-    return int(origin)
-
-
-def _num_frames(num_samples: int, hop_size: float, *, end: FramingEnd = "normal") -> int:
-    if end == "extend":
-        return int(np.floor(num_samples / float(hop_size) + 1))
-    if end == "normal":
-        return int(np.ceil(num_samples / float(hop_size)))
-    raise ValueError(f"Unsupported end-of-signal handling: {end}")
-
-
 def frame_starts_from_fps(
     num_samples: int,
     *,
@@ -6109,8 +6119,8 @@ def frame_starts_from_fps(
     end: FramingEnd = "normal",
 ) -> np.ndarray:
     hop_size = hop_size_from_fps(fps, sample_rate)
-    origin_value = _frame_origin(frame_size, origin)
-    num_frames = _num_frames(num_samples, hop_size, end=end)
+    origin_value = frame_origin_from_mode(frame_size, origin)
+    num_frames = num_frames_for_hop(num_samples, hop_size, end=end)
     reference_samples = (
         np.arange(num_frames, dtype=np.float64) * float(hop_size)
     ).astype(np.int64)

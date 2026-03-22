@@ -95,9 +95,9 @@ from .spectral_ops import (
     stack_feature_blocks,
     stft_features_at_fps,
     superflux_odf,
+    repeat_pad_frames,
     trim_to_shortest,
     triangular_filterbank,
-    repeat_pad_frames,
     weighted_phase_deviation,
     zero_crossing_rate,
 )
