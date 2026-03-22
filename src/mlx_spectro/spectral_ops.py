@@ -5022,29 +5022,21 @@ def num_frames_for_hop(
     raise ValueError(f"Unsupported end-of-signal handling: {end}")
 
 
-def _signal_frame_numpy(
+def _extract_frames_numpy(
     waveform: np.ndarray,
-    index: int,
     *,
+    frame_starts: np.ndarray,
     frame_size: int,
-    hop_size: float,
-    origin: int,
-    pad_value: float = 0.0,
 ) -> np.ndarray:
     num_samples = len(waveform)
-    ref_sample = int(index * hop_size)
-    start = ref_sample - frame_size // 2 - int(origin)
-    stop = start + frame_size
-    if start >= 0 and stop <= num_samples:
-        return waveform[start:stop]
-
-    frame = np.full(frame_size, np.float32(pad_value), dtype=np.float32)
-    left = max(0, -start)
-    right = max(0, stop - num_samples)
-    src_start = max(0, start)
-    src_stop = min(stop, num_samples)
-    frame[left : frame_size - right] = waveform[src_start:src_stop]
-    return frame
+    n_frames = len(frame_starts)
+    offsets = np.arange(frame_size, dtype=np.int64)
+    indices = frame_starts[:, None] + offsets[None, :]
+    valid = (indices >= 0) & (indices < num_samples)
+    safe = np.clip(indices, 0, num_samples - 1)
+    frames = waveform[safe]
+    frames[~valid] = 0.0
+    return frames.astype(np.float32)
 
 
 def stft_features_at_fps(
@@ -5060,19 +5052,11 @@ def stft_features_at_fps(
     waveform_np = _prepare_waveform_numpy(waveform)
     hop_size = hop_size_from_fps(fps, sample_rate)
     origin_value = frame_origin_from_mode(frame_size, origin)
-    num_frames = num_frames_for_hop(len(waveform_np), hop_size, end=end)
-    frames = np.stack(
-        [
-            _signal_frame_numpy(
-                waveform_np,
-                frame_index,
-                frame_size=frame_size,
-                hop_size=hop_size,
-                origin=origin_value,
-            )
-            for frame_index in range(num_frames)
-        ],
-        axis=0,
+    n_frames = num_frames_for_hop(len(waveform_np), hop_size, end=end)
+    ref_samples = (np.arange(n_frames, dtype=np.float64) * hop_size).astype(np.int64)
+    frame_starts = ref_samples - (frame_size // 2) - int(origin_value)
+    frames = _extract_frames_numpy(
+        waveform_np, frame_starts=frame_starts, frame_size=frame_size,
     )
     if circular_shift:
         frames = np.roll(frames, -(frame_size // 2), axis=1)
@@ -5308,6 +5292,7 @@ def spectral_odf(
         circular_shift = any(tag in onset_method for tag in ("phase", "complex"))
 
     hop_size = hop_size_from_fps(fps, sample_rate)
+    # Hardcoded to match madmom's SpectrogramODF default (madmom.audio.spectrogram).
     frame_size = 2048
 
     if (
