@@ -77,8 +77,10 @@ pip install mlx-spectro[torch]
 - Fused overlap-add with autotuned Metal kernels for fast STFT/iSTFT
 - Cached reusable frontends for mel, log-mel, MFCC, filtered spectrograms, and hybrid CQT
 - Shared-STFT descriptor extraction and cached descriptor bundles for repeated-call workloads
+- Madmom-compatible feature extraction: multi-resolution log-diff and mel-stack features, onset detection functions (superflux, complex flux, phase ODFs, etc.), and filterbank builders
 - PyTorch-, torchaudio-, librosa-, and madmom-style compatibility controls where parity matters
 - `mx.compile`-friendly helpers for fixed-shape inference loops, including multi-axis STFT/iSTFT pairs
+- Numpy and MLX dual-path convention: `foo()` returns numpy (evaluates internally), `foo_mlx()` returns lazy `mx.array` for pipeline composition without sync barriers
 - Optional torch fallback for strict numerical parity
 
 ## Quick Start
@@ -100,13 +102,14 @@ reconstructed = transform.istft(spec, length=44100, input_layout="bnf")
 
 ## API
 
-The public API is grouped into six main areas:
+The public API is grouped into seven main areas:
 
 - Core STFT/iSTFT
 - Mel, log-mel, and MFCC frontends
 - Custom filtered frontends
 - Spectral descriptors and shared feature bundles
 - Hybrid CQT
+- Madmom-compat layer (filterbanks, multi-resolution features, onset ODFs)
 - Advanced helpers, diagnostics, and typing aliases
 
 Compiled API contract:
@@ -310,6 +313,8 @@ FilteredSpectrogramTransform(
 
 **Methods:**
 - `filtered_spectrogram(x)` / `__call__(x)` — Returns `[n_bands, frames]` for 1-D input or `[B, n_bands, frames]` for batched input.
+- `filtered_spectrogram_at_starts(x, *, frame_starts)` — Compute the filtered spectrogram at explicit sample positions instead of a fixed hop schedule. `frame_starts` is a rank-1 integer array of per-frame start indices (may be negative for zero-padded pre-roll).
+- `filtered_spectrogram_at_fps(x, *, fps, sample_rate=None, origin="offline", end="normal")` — FPS-driven framing with fractional hop support. Computes frame starts internally from `fps` and delegates to `filtered_spectrogram_at_starts`.
 - `get_compiled()` — Return a cached compiled callable for fixed-shape hot loops.
 
 This is the reusable path for project-specific frontends that apply non-mel filterbanks after one STFT magnitude pass, such as beat/chord/log-frequency pipelines.
@@ -487,6 +492,54 @@ Convert magnitude or power spectrograms to dB. `mode="torchaudio_compat"`
 matches torchaudio's packed-batch clipping behavior, while
 `mode="per_example"` clips each example independently.
 
+### Madmom-compat Layer
+
+Functional API for madmom-style audio feature extraction. Every function that returns materialized numpy output has a corresponding `_mlx` variant that returns a lazy `mx.array` with no internal `mx.eval` barrier. **Downstream code that feeds results into MLX models should always use the `_mlx` variant** to avoid device→host→device round-trips.
+
+**Filterbank builders:**
+
+- `triangular_filterbank(bin_frequencies, num_bands, *, fmin=30.0, fmax=17000.0, fref=440.0, norm_filters=True)` — Log-spaced triangular filterbank from FFT bin frequencies. Returns `[n_freqs, n_bands]`.
+- `mel_filterbank(bin_frequencies, num_bands, *, fmin, fmax, norm_filters=True)` — Mel-spaced triangular filterbank. Returns `[n_freqs, n_bands]`.
+- `rectangular_filterbank(bin_frequencies, crossover_frequencies, *, fmin=30.0, fmax=17000.0, norm_filters=True, unique_filters=True)` — Rectangular (bandpass) filterbank from crossover frequencies. Returns `[n_freqs, n_bands]`.
+- `fft_frequencies(num_fft_bins, sample_rate)` — FFT bin center frequencies. Equivalent to `np.fft.rfftfreq` cast to float32.
+- `log_frequencies(bands_per_octave, fmin, fmax, fref=440.0)` — Logarithmically spaced center frequencies anchored to `fref`.
+
+**Filtered spectrogram helpers:**
+
+- `compute_filtered_spectrogram(waveform, *, frame_size, hop_size, num_bands, ...)` / `compute_filtered_spectrogram_mlx(...)` — Log-frequency filtered spectrogram with cached filterbank and transform. Returns `FilteredSpectrogramResult(spectrogram, filterbank)` (numpy) or `(mx.array, np.ndarray)` (MLX).
+- `compute_mel_spectrogram(waveform, *, frame_size, hop_size, num_bands, ...)` / `compute_mel_spectrogram_mlx(...)` — Mel-filtered spectrogram variant. Same return convention.
+- `compute_filtered_spectrogram_at_fps(waveform, *, frame_size, fps, num_bands, ..., origin="offline", end="normal")` — FPS-driven filtered spectrogram with fractional hop support.
+- `compute_filtered_spectrogram_at_starts(waveform, *, frame_size, frame_starts, num_bands, ...)` — Filtered spectrogram at explicit frame positions.
+- `compute_log_filtered_spectrogram(waveform, *, frame_size, hop_size, num_bands, ...)` — Convenience wrapper that enforces `output_scale="log"`.
+
+**Multi-resolution feature extraction:**
+
+- `madmom_multires_log_diff_features(waveform, *, frame_sizes, fps, num_bands, ...)` / `madmom_multires_log_diff_features_mlx(...)` — Multi-resolution log-spectrogram + positive spectral difference features, concatenated along the frequency axis. This is the standard feature frontend for madmom RNN onset/beat/downbeat models. `num_bands` can be an int (shared) or a tuple (per-resolution). Returns `[frames, total_bands]`.
+- `madmom_multires_mel_stack(waveform, *, frame_sizes, fps, num_bands, ...)` / `madmom_multires_mel_stack_mlx(...)` — Multi-resolution mel spectrograms stacked along a channel axis. Returns `[frames, n_bands, n_resolutions]`.
+- `madmom_single_resolution_log_stack(waveform, *, frame_size, num_bands, ...)` / `madmom_single_resolution_log_stack_mlx(...)` — Single-resolution log or mel spectrogram with optional `backend="stft_compat"` for madmom STFT-level parity (per-frame extraction with fractional hop). Supports `filterbank="log"` or `filterbank="mel"`.
+
+**Frame scheduling:**
+
+- `hop_size_from_fps(fps, sample_rate=44100)` — Convert frames-per-second to hop size in samples (returns float for fractional hops).
+- `frame_starts_from_fps(num_samples, *, frame_size, fps, sample_rate=44100, origin="offline", end="normal")` — Compute per-frame start indices for FPS-driven framing with fractional hop support. Returns an int32 array.
+- `frame_origin_from_mode(frame_size, origin)` — Map origin mode string (`"offline"`, `"online"`, `"future"`, `"center"`, `"past"`) or integer to a sample offset. Matches madmom conventions.
+- `num_frames_for_hop(num_samples, hop_size, *, end="normal")` — Number of frames for a given signal length and hop size. `end="extend"` adds one extra frame.
+- `diff_frames_from_hann(*, frame_size, hop_size, diff_ratio=0.5)` — Derive the spectral-difference lag (in frames) from a Hann window and a `diff_ratio` threshold. Accepts float `hop_size` for fractional hops.
+
+**Onset detection functions:**
+
+- `spectral_odf(waveform, *, onset_method, fps=100.0, filterbank="log", num_bands=12, ...)` — Unified onset detection function dispatcher. Supported methods: `"superflux"`, `"complex_flux"`, `"spectral_flux"`, `"spectral_diff"`, `"high_frequency_content"`, `"modified_kullback_leibler"`, `"phase_deviation"`, `"weighted_phase_deviation"`, `"normalized_weighted_phase_deviation"`, `"complex_domain"`, `"rectified_complex_domain"`. Optional `preset` parameter (`"madmom_offline"`, `"madmom_online"`, `"madmom_superflux"`) sets origin/end defaults.
+- `stft_features_at_fps(waveform, *, frame_size, fps, sample_rate=44100, circular_shift=False, origin="offline", end="normal")` — Numpy STFT with FPS-driven fractional-hop framing. Returns `STFTFeatures(stft, magnitude, phase, bin_frequencies)`. Used internally by `spectral_odf` and available for custom ODF implementations.
+- Individual ODF building blocks are also exported: `superflux_odf`, `complex_flux_odf`, `spectral_flux_odf`, `high_frequency_content_odf`, `modified_kullback_leibler_odf`, `complex_domain_odf`, `rectified_complex_domain_odf`, `phase_deviation`, `weighted_phase_deviation`, `normalized_weighted_phase_deviation`, `local_group_delay`.
+
+**Utility functions:**
+
+- `logarithmic_spectrogram(spec, *, mul=1.0, add=1.0, log_fn=np.log10)` — Apply `log_fn(spec * mul + add)`. Numpy in, numpy out.
+- `positive_spectral_diff_numpy(spec, *, diff_frames, diff_max_bins=None, positive_diffs=True)` — Numpy spectral difference with optional max-bin pooling (superflux-style). See also the MLX `positive_spectral_diff` for on-device computation.
+- `trim_to_shortest(blocks, *, axis=0)` — Trim a list of arrays to the shortest length along `axis`.
+- `repeat_pad_frames(frames, pad_before, *, pad_after=None, axis=0)` — Edge-repeat padding along the time axis (madmom-style).
+- `stack_feature_blocks(blocks, *, layout="feature_stack")` — Concatenate blocks along frequency (`"feature_stack"`) or stack along a channel axis (`"channel_stack"`), trimming to shortest first.
+
 ### Cache and Diagnostics
 
 - `get_cache_debug_stats(reset=False)` — Return cache counters and lightweight kernel/transform cache snapshots.
@@ -499,6 +552,8 @@ The package also exports string-literal typing aliases for option-bearing APIs:
 `ISTFTBackendPolicy`, `STFTOutputLayout`, `CenterPadMode`,
 `CenterTailPad`, `FilteredOutputScale`, `MelScale`, `MelNorm`, `MelMode`,
 `MelOutputScale`, `LogMelMode`, and `WindowLike`.
+
+Frozen dataclasses for structured returns: `FilteredSpectrogramResult(spectrogram, filterbank)` and `STFTFeatures(stft, magnitude, phase, bin_frequencies)`.
 
 ## Benchmarks
 

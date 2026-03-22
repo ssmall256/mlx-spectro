@@ -8,7 +8,7 @@ Everything lives in two files under `src/mlx_spectro/`:
 
 | Module | Purpose |
 |--------|---------|
-| `spectral_ops.py` | All transforms, Metal kernels, caches (~6k lines) |
+| `spectral_ops.py` | All transforms, Metal kernels, caches (~7.7k lines) |
 | `__init__.py` | Public API exports |
 
 **Core transform classes** (each has eager + compiled paths):
@@ -22,6 +22,21 @@ Everything lives in two files under `src/mlx_spectro/`:
 | `MFCCTransform` | Mel-frequency cepstral coefficients |
 | `SpectralFeatureTransform` | Shared-STFT descriptor bundles (one STFT → multiple features) |
 | `RepeatedShapeCompileCache` | Bounded shape promotion to compiled mode |
+
+**Madmom-compat layer** (functional API, numpy + MLX paths):
+
+| Function family | Purpose |
+|-----------------|---------|
+| `compute_filtered_spectrogram[_mlx]` | Log-frequency filtered spectrograms with caching |
+| `compute_mel_spectrogram[_mlx]` | Mel-filtered spectrograms with caching |
+| `madmom_multires_log_diff_features[_mlx]` | Multi-resolution log-spectrogram + spectral diff features |
+| `madmom_multires_mel_stack[_mlx]` | Multi-resolution mel-spectrogram channel stacks |
+| `madmom_single_resolution_log_stack[_mlx]` | Single-resolution log/mel spectrogram with optional stft_compat backend |
+| `spectral_odf` | Onset detection functions (superflux, complex_flux, phase, HFC, etc.) |
+| `triangular_filterbank`, `mel_filterbank`, `rectangular_filterbank` | Filterbank builders |
+| `frame_starts_from_fps`, `stft_features_at_fps` | FPS-driven framing (fractional hop support) |
+
+**Numpy/MLX dual-path convention**: Functions named `foo` return `np.ndarray` (call `mx.eval` internally). Functions named `foo_mlx` return lazy `mx.array` (no eval barrier). Downstream code that feeds results into MLX models should always use the `_mlx` variant to avoid device→host→device round-trips.
 
 ## Key Design Decisions
 
@@ -47,7 +62,7 @@ No C extensions, no special build steps. Pure Python + MLX.
 pytest tests/ -v
 ```
 
-9 test files. Tests use `np.testing.assert_allclose()` for parity with torch/torchaudio/librosa. Optional imports skipped via `pytest.importorskip()`. No conftest.py.
+11 test files. Tests use `np.testing.assert_allclose()` for parity with torch/torchaudio/librosa. Optional imports skipped via `pytest.importorskip()`. No conftest.py. `test_mlx_numpy_parity.py` verifies `_mlx` variants match numpy counterparts.
 
 ## Benchmarks
 
@@ -69,9 +84,11 @@ Pattern: 5 warmup, 20 iterations, median latency, markdown tables.
 
 ## Ecosystem
 
-**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (spectral backend), and any MLX audio pipeline needing spectral transforms.
+**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (spectral backend), madmom-mlx (onset/beat/note pipelines), and any MLX audio pipeline needing spectral transforms.
 
 ## Feedback
+
+Before finishing your task, you MUST check whether you encountered any bugs, unexpected behavior, workflow friction, missing features, or surprising performance. If so, record each one:
 
 ```bash
 devfeedback mlx-spectro "description of bug, friction, or idea"
