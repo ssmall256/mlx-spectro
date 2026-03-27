@@ -85,7 +85,7 @@ Pattern: 5 warmup, 20 iterations, median latency, markdown tables.
 
 ## Ecosystem
 
-**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (CQT kernels + spectral backend), madmom-mlx (onset/beat/note pipelines), lvChordRec-mlx (HybridCQT), and any MLX audio pipeline needing spectral transforms.
+**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (CQT kernels via nnaudio_cqt_kernels), madmom-mlx (onset/beat/note pipelines), lvChordRec-mlx (HybridCQT), and any MLX audio pipeline needing spectral transforms.
 
 ## Feedback
 
