@@ -50,6 +50,8 @@ Checked-in baselines live in `benchmarks/baselines/`. Run `scripts/check_benchma
 
 ## Feedback
 
+Before finishing your task, you MUST check whether you encountered any bugs, unexpected behavior, workflow friction, missing features, or surprising performance. If so, record each one:
+
 ```bash
 devfeedback mlx-spectro "description of bug, friction, or idea"
 ```

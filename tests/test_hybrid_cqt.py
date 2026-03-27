@@ -1,7 +1,7 @@
 import mlx.core as mx
 import numpy as np
 
-from mlx_spectro import HybridCQTTransform, hybrid_cqt
+from mlx_spectro import HybridCQTTransform, hybrid_cqt, nnaudio_cqt_kernels
 from tests.hybrid_cqt_snapshots import HYBRID_CQT_SNAPSHOTS
 
 
@@ -129,3 +129,61 @@ def test_hybrid_cqt_compile_smoke():
     eager = _to_numpy(transform(x))
     compiled_out = _to_numpy(compiled(x))
     np.testing.assert_allclose(eager, compiled_out, rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# nnaudio CQT kernel generation
+# ---------------------------------------------------------------------------
+
+
+def test_nnaudio_cqt_kernels_shapes():
+    kr, ki, sl, lp = nnaudio_cqt_kernels(
+        sr=22050, fmin=27.5, n_bins=309, bins_per_octave=36,
+    )
+    assert kr.shape == (36, 256)
+    assert ki.shape == (36, 256)
+    assert sl.shape == (309,)
+    assert lp.shape == (256,)
+    assert kr.dtype == np.float32
+    assert ki.dtype == np.float32
+    assert sl.dtype == np.float32
+    assert lp.dtype == np.float32
+
+
+def test_nnaudio_cqt_kernels_l1_normalized():
+    kr, ki, _, _ = nnaudio_cqt_kernels(
+        sr=22050, fmin=27.5, n_bins=309, bins_per_octave=36,
+    )
+    for b in range(kr.shape[0]):
+        mag = np.sqrt(kr[b] ** 2 + ki[b] ** 2)
+        np.testing.assert_allclose(mag.sum(), 1.0, atol=1e-6)
+
+
+def test_nnaudio_cqt_kernels_hann_window():
+    """Kernel envelopes should correlate highly with periodic Hann windows."""
+    kr, ki, _, _ = nnaudio_cqt_kernels(
+        sr=22050, fmin=27.5, n_bins=309, bins_per_octave=36,
+    )
+    # Check bin 0 (longest support)
+    mag = np.sqrt(kr[0] ** 2 + ki[0] ** 2)
+    nz = np.where(mag > 1e-6)[0]
+    envelope = mag[nz]
+    n = np.arange(len(nz), dtype=np.float64)
+    hann = 0.5 - 0.5 * np.cos(2 * np.pi * n / len(nz))
+    corr = np.corrcoef(envelope, hann)[0, 1]
+    assert corr > 0.999, f"Hann correlation too low: {corr}"
+
+
+def test_nnaudio_cqt_kernels_lowpass_symmetric():
+    """Lowpass filter should be symmetric (linear phase)."""
+    _, _, _, lp = nnaudio_cqt_kernels()
+    np.testing.assert_allclose(lp, lp[::-1], atol=1e-7)
+
+
+def test_nnaudio_cqt_kernels_custom_params():
+    """Different parameters should produce different shaped outputs."""
+    kr, ki, sl, lp = nnaudio_cqt_kernels(
+        sr=16000, fmin=55.0, n_bins=84, bins_per_octave=12,
+    )
+    assert kr.shape[0] == 12  # bins_per_octave filters
+    assert sl.shape == (84,)

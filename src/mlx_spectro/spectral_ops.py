@@ -6527,6 +6527,151 @@ def _cached_hybrid_cqt_plan(
     }
 
 
+# ---------------------------------------------------------------------------
+# nnaudio CQT2010v2 kernel generation
+# ---------------------------------------------------------------------------
+
+
+def nnaudio_cqt_kernels(
+    *,
+    sr: int = 22050,
+    fmin: float = 27.5,
+    n_bins: int = 309,
+    bins_per_octave: int = 36,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generate CQT kernels matching the nnaudio CQT2010v2 algorithm.
+
+    Reproduces the exact time-domain kernel construction used by
+    `nnAudio.features.cqt.CQT2010v2 <https://github.com/KinWaiCheuk/nnAudio>`_
+    (as used in Spotify's basic-pitch ICASSP 2022 model). The algorithm:
+
+    1. Compute Q factor and adjusted ``fmin`` for the top octave
+    2. Build windowed complex sinusoid kernels (periodic Hann, L1-normalized)
+    3. Compute ``sqrt(lengths)`` normalization for all bins
+    4. Generate FIR lowpass filter for octave downsampling
+
+    All four output arrays are bit-identical to those extracted from the
+    original basic-pitch ONNX model.
+
+    Parameters
+    ----------
+    sr : int
+        Audio sample rate (default 22050).
+    fmin : float
+        Lowest CQT frequency in Hz (default 27.5, A0).
+    n_bins : int
+        Total number of CQT frequency bins (default 309).
+    bins_per_octave : int
+        Number of bins per octave (default 36, i.e. 3 per semitone).
+
+    Returns
+    -------
+    kernel_real : np.ndarray, shape ``(n_filters, n_fft)``
+        Real part of the time-domain CQT convolution kernels.
+    kernel_imag : np.ndarray, shape ``(n_filters, n_fft)``
+        Imaginary part of the time-domain CQT convolution kernels.
+    sqrt_lengths : np.ndarray, shape ``(n_bins,)``
+        Per-bin normalization factors (``sqrt(ceil(Q * sr / freq))``).
+    lowpass : np.ndarray, shape ``(256,)``
+        FIR lowpass filter for octave-by-octave downsampling.
+    """
+    sr = int(sr)
+    fmin = float(fmin)
+    n_bins = int(n_bins)
+    bins_per_octave = int(bins_per_octave)
+
+    Q = 1.0 / (2 ** (1 / bins_per_octave) - 1)
+    n_octaves = int(np.ceil(n_bins / bins_per_octave))
+    n_filters = min(bins_per_octave, n_bins)
+
+    # Adjusted fmin for the top octave (nnaudio CQT2010v2.build logic)
+    fmin_t = fmin * 2 ** (n_octaves - 1)
+    remainder = n_bins % bins_per_octave
+    if remainder == 0:
+        fmax_t = fmin_t * 2 ** ((bins_per_octave - 1) / bins_per_octave)
+    else:
+        fmax_t = fmin_t * 2 ** ((remainder - 1) / bins_per_octave)
+    fmin_t = fmax_t / 2 ** (1 - 1 / bins_per_octave)
+
+    # Kernel length (next power of 2 of longest filter)
+    n_fft = 2 ** int(np.ceil(np.log2(np.ceil(Q * sr / fmin_t))))
+
+    # Time-domain kernels: periodic Hann window, L1-normalized
+    freqs_kernel = fmin_t * 2.0 ** (np.arange(n_filters) / bins_per_octave)
+    kernel = np.zeros((n_filters, n_fft), dtype=np.complex64)
+
+    for k in range(n_filters):
+        freq = freqs_kernel[k]
+        _l = int(np.ceil(Q * sr / freq))
+        start = int(np.ceil(n_fft / 2.0 - _l / 2.0)) - int(_l % 2)
+
+        # Periodic Hann window
+        n = np.arange(_l, dtype=np.float64)
+        win = 0.5 - 0.5 * np.cos(2 * np.pi * n / _l)
+
+        sig = (
+            win
+            * np.exp(np.r_[-_l // 2 : _l // 2] * 1j * 2 * np.pi * freq / sr)
+            / _l
+        )
+        sig = sig / np.linalg.norm(sig, 1)  # L1 normalization
+        kernel[k, start : start + _l] = sig
+
+    kernel_real = kernel.real.astype(np.float32)
+    kernel_imag = kernel.imag.astype(np.float32)
+
+    # sqrt(lengths) for librosa-style normalization across all bins
+    freqs_all = fmin * 2.0 ** (np.arange(n_bins) / bins_per_octave)
+    sqrt_lengths = np.sqrt(np.ceil(Q * sr / freqs_all)).astype(np.float32)
+
+    # FIR lowpass filter for octave downsampling (frequency-sampling design)
+    lowpass = _nnaudio_lowpass_filter(256, 0.001)
+
+    return kernel_real, kernel_imag, sqrt_lengths, lowpass
+
+
+def _nnaudio_lowpass_filter(
+    numtaps: int,
+    transition_bandwidth: float,
+) -> np.ndarray:
+    """FIR lowpass filter matching nnaudio's ``create_lowpass_filter``.
+
+    Uses frequency-sampling design (equivalent to ``scipy.signal.firwin2``)
+    with a Hamming window. The filter has unity gain below the passband edge
+    and zero gain above the stopband edge.
+
+    Parameters
+    ----------
+    numtaps : int
+        Filter length.
+    transition_bandwidth : float
+        Fractional width of the transition band around the 0.5 cutoff.
+
+    Returns
+    -------
+    np.ndarray, shape ``(numtaps,)``
+        FIR filter coefficients, float32.
+    """
+    passband_max = 0.5 / (1 + transition_bandwidth)
+    stopband_min = 0.5 * (1 + transition_bandwidth)
+    freq = [0.0, passband_max, stopband_min, 1.0]
+    gain = [1.0, 1.0, 0.0, 0.0]
+
+    # Frequency-sampling design (firwin2 algorithm)
+    nfreqs = 1 + 2 ** int(np.ceil(np.log2(numtaps)))
+    x = np.linspace(0.0, 1.0, nfreqs)
+    fx = np.interp(x, freq, gain)
+
+    # Phase shift so first numtaps of IRFFT give the filter coefficients
+    shift = np.exp(-(numtaps - 1) / 2.0 * 1j * np.pi * x)
+    out_full = np.fft.irfft(fx * shift)
+
+    # Hamming window and truncate
+    out = out_full[:numtaps] * np.hamming(numtaps)
+
+    return out.astype(np.float32)
+
+
 def _pad_waveform(
     x: mx.array,
     *,

@@ -19,6 +19,7 @@ Everything lives in two files under `src/mlx_spectro/`:
 | `MelSpectrogramTransform` | Mel-scale frontend (mlx_native, torchaudio_compat modes) |
 | `FilteredSpectrogramTransform` | Custom filterbank projection (mel, chroma, log-freq) |
 | `HybridCQTTransform` | Librosa-compatible hybrid constant-Q transform |
+| `nnaudio_cqt_kernels()` | nnaudio CQT2010v2 kernel generation (time-domain, no scipy) |
 | `MFCCTransform` | Mel-frequency cepstral coefficients |
 | `SpectralFeatureTransform` | Shared-STFT descriptor bundles (one STFT → multiple features) |
 | `RepeatedShapeCompileCache` | Bounded shape promotion to compiled mode |
@@ -84,7 +85,7 @@ Pattern: 5 warmup, 20 iterations, median latency, markdown tables.
 
 ## Ecosystem
 
-**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (spectral backend), madmom-mlx (onset/beat/note pipelines), and any MLX audio pipeline needing spectral transforms.
+**No dependencies on** other ~/Code/ projects. **Consumed by**: mlx-audio-separator, basic-pitch-mlx (CQT kernels + spectral backend), madmom-mlx (onset/beat/note pipelines), lvChordRec-mlx (HybridCQT), and any MLX audio pipeline needing spectral transforms.
 
 ## Feedback
 
