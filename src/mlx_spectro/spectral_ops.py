@@ -6052,6 +6052,54 @@ def mel_filterbank(
     )
 
 
+def mel_filterbank_librosa(
+    sr: int,
+    n_fft: int,
+    n_mels: int,
+    *,
+    fmin: float = 0.0,
+    fmax: float | None = None,
+    htk: bool = True,
+    norm: str | None = "slaney",
+) -> np.ndarray:
+    """Mel filterbank matching librosa.filters.mel exactly.
+
+    Uses continuous frequency interpolation (not bin-aligned) and
+    supports ``norm='slaney'`` (divide by bandwidth) which is librosa's
+    default.  Returns ``[n_fft//2+1, n_mels]`` (transposed vs librosa's
+    ``[n_mels, n_fft//2+1]``) to match mlx-spectro's convention.
+
+    Reference: librosa.filters.mel
+    """
+    if fmax is None:
+        fmax = float(sr) / 2.0
+
+    if htk:
+        hz2mel = lambda f: 2595.0 * np.log10(1.0 + np.asarray(f, dtype=np.float64) / 700.0)
+        mel2hz = lambda m: 700.0 * (10.0 ** (np.asarray(m, dtype=np.float64) / 2595.0) - 1.0)
+    else:
+        hz2mel = lambda f: _hz_to_mel(np.asarray(f, dtype=np.float64), mel_scale="slaney")
+        mel2hz = lambda m: _mel_to_hz(np.asarray(m, dtype=np.float64), mel_scale="slaney")
+
+    mel_f = mel2hz(np.linspace(hz2mel(fmin), hz2mel(fmax), n_mels + 2))
+    fft_freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+
+    fdiff = np.diff(mel_f)
+    ramps = np.subtract.outer(mel_f, fft_freqs)
+
+    weights = np.zeros((n_mels, len(fft_freqs)), dtype=np.float64)
+    for i in range(n_mels):
+        lower = -ramps[i] / fdiff[i]
+        upper = ramps[i + 2] / fdiff[i + 1]
+        weights[i] = np.maximum(0.0, np.minimum(lower, upper))
+
+    if norm == "slaney":
+        enorm = 2.0 / (mel_f[2 : n_mels + 2] - mel_f[:n_mels])
+        weights *= enorm[:, np.newaxis]
+
+    return weights.astype(np.float32).T  # [n_fft//2+1, n_mels]
+
+
 def rectangular_filterbank(
     bin_frequencies: np.ndarray,
     crossover_frequencies: tuple[float, ...] | list[float],

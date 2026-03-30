@@ -352,6 +352,8 @@ HybridCQTTransform(
 
 Hybrid CQT basis construction is implemented directly in-package and cached at init time. Repeated calls stay on MLX tensors; no extra package dependencies are required beyond `numpy`.
 
+**Dynamic range note**: `HybridCQTTransform` returns raw CQT magnitude with 5–6 orders of magnitude dynamic range. If your model uses InstanceNorm or similar per-frame normalization, quiet passages can be overwhelmed by loud sections in the normalization statistics — consider applying explicit frame-level energy normalization (e.g. median-based gain) before inference. This does not apply to `FilteredSpectrogramTransform` with `output_scale="log10_plus_one"` or `LogMelSpectrogramTransform`: log10(1+x) scaling already compresses dynamic range by ~2 orders of magnitude, making explicit energy equalization redundant for those frontends.
+
 ### `hybrid_cqt(x, *, sr=22050, hop_length=512, fmin=32.70319566257483, n_bins=84, bins_per_octave=12, filter_scale=1.0, norm=1.0, sparsity=0.01)`
 
 Functional one-off helper with the same parameters as `HybridCQTTransform`.
