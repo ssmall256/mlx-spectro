@@ -1,7 +1,8 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
+from .librosa_cqt import VQTPlan, build_vqt_plan, vqt
 from .spectral_ops import (
     DEFAULT_FMAX,
     DEFAULT_FMIN,
@@ -105,6 +106,9 @@ from .spectral_ops import (
 )
 
 __all__ = [
+    "VQTPlan",
+    "build_vqt_plan",
+    "vqt",
     "SpectralTransform",
     "RepeatedShapeCompileCache",
     "FilteredSpectrogramResult",
