@@ -169,22 +169,21 @@ SpectralTransform(
 ```
 
 **Methods:**
-> **STFT layout is changing in 1.0.** `stft`/`istft` and the `get_compiled_*` /
-> `*_compiled` helpers default to `"bfn"` (batch, freq, frames); `compiled_pair` and
-> `compiled_pair_nd` default to `"bnf"` (batch, frames, freq). In 1.0 **all of them
-> converge on `"bnf"`**, MLX's native rFFT order. Relying on either default now emits a
-> `FutureWarning` naming the call site; pass `output_layout=` / `input_layout=` /
-> `layout=` explicitly to pin today's behaviour and silence it. The signature defaults
-> read `"auto"`, which means "this entry point's current default".
+> **One STFT layout throughout: `"bfn"`.** Every entry point -- eager, compiled,
+> and the `get_compiled_*` helpers -- returns and accepts `[B, F, N]` (batch,
+> frequency, frames) by default. `bfn` suits MLX's channel-last grain and is what
+> spectrogram models here consume directly. Pass `output_layout="bnf"` /
+> `input_layout="bnf"` / `layout="bnf"` for `[B, N, F]` if you want the native
+> rFFT order, for example when porting PyTorch code that expects it.
 
-- `stft(x, output_layout="auto")` — Forward STFT. Input: `[T]` or `[B, T]`. Default resolves to `"bfn"`.
-- `istft(z, length=None, validate=False, *, torch_like=False, allow_fused=True, safety="auto", long_mode_strategy="native", backend_policy=None, input_layout="auto")` — Inverse STFT. Returns `[B, T]`. Default resolves to `"bfn"`.
-- `compiled_pair(length, layout="auto", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
-- `compiled_pair_nd(length, leading_shape, layout="auto")` — Return compiled reshape-aware `(stft_fn, istft_fn)` for fixed multi-axis inputs such as `[B, C, T]`.
+- `stft(x, output_layout="bfn")` — Forward STFT. Input: `[T]` or `[B, T]`.
+- `istft(z, length=None, validate=False, *, torch_like=False, allow_fused=True, safety="auto", long_mode_strategy="native", backend_policy=None, input_layout="bfn")` — Inverse STFT. Returns `[B, T]`.
+- `compiled_pair(length, layout="bfn", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
+- `compiled_pair_nd(length, leading_shape, layout="bfn")` — Return compiled reshape-aware `(stft_fn, istft_fn)` for fixed multi-axis inputs such as `[B, C, T]`.
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
 - `prewarm_kernels(batch=1, length=None)` — Precompile eager STFT plus fused and legacy iSTFT kernels.
 - `prewarm_compiled(batch=1, length=None, ...)` — Precompile cached compiled STFT/iSTFT callables.
-- `get_compiled_stft(output_layout="auto")` / `stft_compiled(x, output_layout="auto")` — Cached `mx.compile` STFT helpers for fixed-shape loops.
+- `get_compiled_stft(output_layout="bfn")` / `stft_compiled(x, output_layout="bfn")` — Cached `mx.compile` STFT helpers for fixed-shape loops.
 - `get_compiled_istft(...)` / `istft_compiled(z, ...)` — Cached `mx.compile` iSTFT helpers for fixed-shape loops.
 - `differentiable_stft(x)` — STFT entry point intended for `mx.grad` / `mx.value_and_grad`, returns `[B, N, F]`.
 - `differentiable_istft(z, length=None)` — iSTFT entry point intended for gradients, expects `[B, N, F]`.

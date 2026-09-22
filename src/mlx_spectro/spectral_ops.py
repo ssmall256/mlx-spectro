@@ -2120,59 +2120,17 @@ def _resolve_backend_policy(
     return policy
 
 
-#: Target layout once the split below is resolved. See _resolve_stft_output_layout.
-_STFT_LAYOUT_CONVERGENCE_TARGET = "bnf"
-_STFT_LAYOUT_CONVERGENCE_RELEASE = "1.0"
-
-
-def _warn_default_stft_layout(entry_point: str, resolved: str) -> None:
-    """Announce that this call relied on a layout default that is going to move.
-
-    `stft`/`istft` and the `get_compiled_*`/`*_compiled` methods default to
-    "bfn"; `compiled_pair`/`compiled_pair_nd` default to "bnf". Callers who pass
-    nothing therefore get different axis orders from two halves of the same API,
-    and in 1.0 both halves converge on "bnf" -- the native rFFT order.
-
-    This is a FutureWarning rather than the DeprecationWarning used elsewhere in
-    this module, deliberately. Python hides DeprecationWarning outside __main__,
-    so a deprecation here would be invisible to exactly the application authors
-    who have to act on it. FutureWarning is the documented category for a
-    behaviour change aimed at end users, and the default filter prints it once
-    per call site, which is the right cadence -- so no manual dedupe is added.
-    """
-    warnings.warn(
-        f"{entry_point}() relied on the default STFT layout, which currently "
-        f"resolves to {resolved!r}. The eager and compiled APIs disagree today "
-        f"(\"bfn\" vs \"bnf\") and both converge on "
-        f"{_STFT_LAYOUT_CONVERGENCE_TARGET!r} in "
-        f"{_STFT_LAYOUT_CONVERGENCE_RELEASE}. Pass the layout explicitly to pin "
-        "today's behaviour and silence this warning.",
-        FutureWarning,
-        stacklevel=4,
-    )
-
-
 def _resolve_stft_output_layout(
     output_layout: Optional[str],
     *,
     default_layout: str = "bfn",
-    entry_point: Optional[str] = None,
 ) -> str:
-    """Resolve a layout argument, warning when the caller relied on the default.
-
-    ``None`` and ``"auto"`` both mean "whatever this entry point defaults to".
-    ``"auto"`` is the signature default so that relying on it is observable;
-    ``None`` is still accepted for callers that pass it through.
-    """
-    relied_on_default = output_layout is None or output_layout == "auto"
-    layout = default_layout if relied_on_default else str(output_layout)
+    layout = default_layout if output_layout is None else str(output_layout)
     if layout not in _STFT_OUTPUT_LAYOUTS:
         raise ValueError(
             "output_layout must be one of "
-            f"{_STFT_OUTPUT_LAYOUTS + ('auto',)}"
+            f"{_STFT_OUTPUT_LAYOUTS}"
         )
-    if relied_on_default and entry_point is not None:
-        _warn_default_stft_layout(entry_point, layout)
     return layout
 
 
@@ -2505,11 +2463,9 @@ class SpectralTransform:
         )
         mx.eval(z, y)
 
-    def get_compiled_stft(self, *, output_layout: str = "auto"):
+    def get_compiled_stft(self, *, output_layout: str = "bfn"):
         """Return a cached compiled STFT callable for steady-shape workloads."""
-        resolved_layout = _resolve_stft_output_layout(
-            output_layout, default_layout="bfn", entry_point="get_compiled_stft"
-        )
+        resolved_layout = _resolve_stft_output_layout(output_layout)
         cached = self._compiled_stft_fns.get(resolved_layout)
         if cached is not None:
             _record_cache_event("compiled_stft_cache.hit", key=resolved_layout)
@@ -2533,7 +2489,7 @@ class SpectralTransform:
         safety: str = "auto",
         long_mode_strategy: str = "native",
         backend_policy: Optional[str] = None,
-        input_layout: str = "auto",
+        input_layout: str = "bfn",
     ):
         """Return a cached compiled iSTFT callable for fixed runtime options.
 
@@ -2553,9 +2509,7 @@ class SpectralTransform:
                 "Compiled iSTFT does not support backend_policy='torch_fallback'. "
                 "Use eager istft for torch fallback behavior."
             )
-        resolved_input_layout = _resolve_stft_output_layout(
-            input_layout, default_layout="bfn", entry_point="get_compiled_istft"
-        )
+        resolved_input_layout = _resolve_stft_output_layout(input_layout)
 
         key = (
             int(length) if length is not None else -1,
@@ -2590,7 +2544,7 @@ class SpectralTransform:
         self._compiled_istft_fns[key] = _compiled
         return _compiled
 
-    def stft_compiled(self, x: mx.array, *, output_layout: str = "auto") -> mx.array:
+    def stft_compiled(self, x: mx.array, *, output_layout: str = "bfn") -> mx.array:
         """Execute compiled STFT using cached compiled graph."""
         return self.get_compiled_stft(output_layout=output_layout)(x)
 
@@ -2605,7 +2559,7 @@ class SpectralTransform:
         safety: str = "auto",
         long_mode_strategy: str = "native",
         backend_policy: Optional[str] = None,
-        input_layout: str = "auto",
+        input_layout: str = "bfn",
     ) -> mx.array:
         """Execute compiled iSTFT using cached compiled graph for fixed options."""
         fn = self.get_compiled_istft(
@@ -2624,7 +2578,7 @@ class SpectralTransform:
         self,
         *,
         length: int,
-        layout: str = "auto",
+        layout: str = "bfn",
         warmup_batch: Optional[int] = None,
     ) -> tuple:
         """Return ``(stft_fn, istft_fn)`` compiled for a fixed configuration.
@@ -2654,9 +2608,7 @@ class SpectralTransform:
                 y = istft(z)
                 mx.eval(y)
         """
-        resolved_layout = _resolve_stft_output_layout(
-            layout, default_layout="bnf", entry_point="compiled_pair"
-        )
+        resolved_layout = _resolve_stft_output_layout(layout)
 
         # Prime the NOLA safety cache with one eager call so the compiled
         # path never hits an mx.eval barrier inside the safety check.
@@ -2690,7 +2642,7 @@ class SpectralTransform:
         *,
         length: int,
         leading_shape: tuple[int, ...],
-        layout: str = "auto",
+        layout: str = "bfn",
     ) -> tuple:
         """Return compiled STFT/iSTFT callables for fixed leading dimensions.
 
@@ -2698,9 +2650,7 @@ class SpectralTransform:
         callers with stable multi-axis layouts (for example ``[B, C, T]``)
         can avoid paying Python reshape overhead on every call.
         """
-        resolved_layout = _resolve_stft_output_layout(
-            layout, default_layout="bnf", entry_point="compiled_pair_nd"
-        )
+        resolved_layout = _resolve_stft_output_layout(layout)
         leading = tuple(int(dim) for dim in leading_shape)
         if not leading:
             raise ValueError("leading_shape must contain at least one dimension")
@@ -3168,16 +3118,14 @@ class SpectralTransform:
         self._cache_key = key
         return denom, denom_inv
 
-    def stft(self, x: mx.array, *, output_layout: str = "auto") -> mx.array:
+    def stft(self, x: mx.array, *, output_layout: str = "bfn") -> mx.array:
         """
         Forward STFT.
         Input: [T] or [B, T]
         Output: [B, F, N] (Complex, `output_layout="bfn"`), or
                 [B, N, F] (Complex, `output_layout="bnf"`)
         """
-        resolved_layout = _resolve_stft_output_layout(
-            output_layout, default_layout="bfn", entry_point="stft"
-        )
+        resolved_layout = _resolve_stft_output_layout(output_layout)
         if x.ndim == 1:
             x = x[None, :]
         elif x.ndim != 2:
@@ -3335,7 +3283,7 @@ class SpectralTransform:
         safety: str = "auto",
         long_mode_strategy: str = "native",
         backend_policy: Optional[str] = None,
-        input_layout: str = "auto",
+        input_layout: str = "bfn",
     ) -> mx.array:
         """
         Inverse STFT.
@@ -3372,9 +3320,7 @@ class SpectralTransform:
             backend_policy,
             default_policy=self.istft_backend_policy,
         )
-        resolved_input_layout = _resolve_stft_output_layout(
-            input_layout, default_layout="bfn", entry_point="istft"
-        )
+        resolved_input_layout = _resolve_stft_output_layout(input_layout)
         if resolved_backend != "auto" and long_mode_strategy != "native":
             raise ValueError(
                 "When backend_policy is not 'auto', long_mode_strategy must be 'native'."

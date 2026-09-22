@@ -39,26 +39,18 @@
 - A Metal kernel that fails to compile now warns once instead of silently latching a
   permanent, slower, differently-rounded pure-MLX path.
 
-### Deprecated
-
-- **Relying on the default STFT layout.** `stft`/`istft` and the `get_compiled_*` /
-  `*_compiled` helpers default to `"bfn"` while `compiled_pair`/`compiled_pair_nd`
-  default to `"bnf"` — two halves of the same API handing back different axis orders.
-  In **1.0** both converge on `"bnf"`, the native rFFT order. The eight signature
-  defaults now read `"auto"`, meaning "this entry point's current default", and using
-  one emits a `FutureWarning` naming the call site and what it resolved to. Pass the
-  layout explicitly to pin today's behaviour.
-
-  **No behaviour changes in this release** — every entry point resolves exactly as
-  before, which is now pinned by tests that did not previously exist (a layout default
-  could have moved, or regressed, entirely unnoticed).
-
-  `FutureWarning` rather than `DeprecationWarning` is deliberate: Python hides
-  `DeprecationWarning` outside `__main__`, so it would never reach the application
-  authors who have to act on this. The default filter prints a `FutureWarning` once per
-  call site, which is the right cadence, so no manual dedupe is applied.
-
 ### Changed
+
+- **`compiled_pair` and `compiled_pair_nd` now default to the `"bfn"` layout**, matching
+  the other six STFT entry points. Previously they alone defaulted to `"bnf"`, so two
+  halves of one API returned different axis orders for a caller who passed nothing.
+  Every real caller of the compiled half already overrode it back to `"bfn"` — the
+  clearest evidence available that the split was a defect, not a choice. `"bfn"` also
+  suits MLX's channel-last grain and is what spectrogram models consume directly.
+  `layout="bnf"` remains available and is unchanged.
+
+  Newly pinned by tests: nothing previously asserted any entry point's default layout,
+  so a change to one — or a regression — would have shipped green.
 
 - Minimum MLX raised to 0.31.2, matching the rest of the MLX audio stack.
 

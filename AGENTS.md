@@ -7,7 +7,7 @@ Spectral frontend for MLX. Fused Metal kernels for STFT/iSTFT, mel/MFCC/CQT fron
 ## Hard Rules
 
 - **All Metal kernels use `mx.fast.metal_kernel()`** with compile-time template constants (HOP, FRAME, UNROLL_K). Do not use runtime parameters for values that affect thread dispatch.
-- **Never break the compiled contract.** `get_compiled()`, `compiled_pair()`, `compiled_pair_nd()` must return callables that produce identical results to eager paths. Test both. Note the eager and compiled halves default to *different* STFT layouts (`"bfn"` vs `"bnf"`), so "identical" means identical at the same layout — always pass one explicitly in tests. Both converge on `"bnf"` in 1.0; until then the signature defaults read `"auto"` and using one emits a `FutureWarning`.
+- **Never break the compiled contract.** `get_compiled()`, `compiled_pair()`, `compiled_pair_nd()` must return callables that produce identical results to eager paths. Test both. All entry points default to the `"bfn"` layout; keep it that way — a split default is how the compiled half silently disagreed with the eager half before.
 - **Do not add dependencies.** Core deps are `mlx` and `numpy` only. torch is optional (benchmark/compat only).
 - **Autotune cache must remain optional.** Disable with `SPEC_MLX_AUTOTUNE=0`. Never require persisted autotune state for correctness.
 - **iSTFT backend policy must be respected.** `"auto"`, `"mlx_fft"`, `"metal"`, `"torch_fallback"` — each must work independently. Don't assume Metal is available.
