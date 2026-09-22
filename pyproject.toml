@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-spectro"
-version = "0.8.0"
+version = "0.9.0"
 description = "High-performance spectral frontends for Apple MLX: STFT/iSTFT, mel, descriptors, and hybrid CQT"
 readme = "README.md"
 license = "MIT"
@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "mlx>=0.30.3",
+    "mlx>=0.31.2",
     "numpy",
 ]
 

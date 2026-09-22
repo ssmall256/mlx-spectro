@@ -743,6 +743,32 @@ out[i] = re * re + im * im;
 """
 
 
+_METAL_WARNED = False
+
+
+def _warn_metal_unavailable(kernel_name: str, error: BaseException) -> None:
+    """Warn once when a Metal kernel fails to compile.
+
+    Every kernel compile site swallows the exception and latches a False
+    sentinel, and the cache-event counters are no-ops unless
+    SPEC_MLX_CACHE_STATS=1. A user whose Metal kernels fail therefore gets a
+    slower, differently-rounded pure-MLX path silently and permanently. One
+    warning is enough to make that diagnosable without becoming noise.
+    """
+    global _METAL_WARNED
+    if _METAL_WARNED:
+        return
+    _METAL_WARNED = True
+    warnings.warn(
+        f"mlx-spectro: Metal kernel {kernel_name!r} failed to compile "
+        f"({type(error).__name__}: {error}). Falling back to pure-MLX paths, "
+        "which are slower and may round differently. Subsequent kernel "
+        "failures will not be reported.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
 class _PowerSpectrumCache:
     """Singleton for the fused power-spectrum Metal kernel."""
     _lock = threading.Lock()
@@ -762,8 +788,9 @@ class _PowerSpectrumCache:
                     output_names=["out"],
                     source=_METAL_POWER_SPECTRUM_TEMPLATE,
                 )
-            except Exception:
+            except Exception as exc:
                 cls._kernel = False
+                _warn_metal_unavailable('fused_power_spectrum', exc)
             return cls._kernel
 
 
@@ -787,8 +814,9 @@ class _FrameExtractCache:
                     output_names=["out"],
                     source=_METAL_FUSED_FRAME_EXTRACT_TEMPLATE,
                 )
-            except Exception:
+            except Exception as exc:
                 cls._simple = False
+                _warn_metal_unavailable('fused_frame_extract', exc)
             return cls._simple
 
     @classmethod
@@ -805,8 +833,9 @@ class _FrameExtractCache:
                     output_names=["out"],
                     source=_METAL_TILED_FRAME_EXTRACT_TEMPLATE,
                 )
-            except Exception:
+            except Exception as exc:
                 cls._tiled = False
+                _warn_metal_unavailable('tiled_frame_extract', exc)
             return cls._tiled
 
     @classmethod
@@ -857,8 +886,9 @@ class _BackwardKernelCache:
                     output_names=["out"],
                     source=_METAL_STFT_BACKWARD_TEMPLATE,
                 )
-            except Exception:
+            except Exception as exc:
                 cls._stft_bwd = False
+                _warn_metal_unavailable('stft_backward', exc)
             return cls._stft_bwd
 
     @classmethod
@@ -875,8 +905,9 @@ class _BackwardKernelCache:
                     output_names=["out"],
                     source=_METAL_ISTFT_BACKWARD_TEMPLATE,
                 )
-            except Exception:
+            except Exception as exc:
                 cls._istft_bwd = False
+                _warn_metal_unavailable('istft_backward', exc)
             return cls._istft_bwd
 
 
@@ -1187,8 +1218,9 @@ class _KernelCache:
                     source=_METAL_OLA_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.ola.compile_ok")
-            except Exception:
+            except Exception as exc:
                 cls._ola_kernel = False
+                _warn_metal_unavailable('ola_windowed_optimized', exc)
                 _record_cache_event("kernel_cache.ola.compile_fail")
             return cls._ola_kernel
 
@@ -1210,8 +1242,9 @@ class _KernelCache:
                     source=_METAL_OLA_NORM_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.ola_norm.compile_ok")
-            except Exception:
+            except Exception as exc:
                 cls._ola_norm_kernel = False
+                _warn_metal_unavailable('ola_norm_windowed_div_envelope', exc)
                 _record_cache_event("kernel_cache.ola_norm.compile_fail")
             return cls._ola_norm_kernel
 
@@ -1233,8 +1266,9 @@ class _KernelCache:
                     source=_METAL_OLA_ENVELOPE_TEMPLATE,
                 )
                 _record_cache_event("kernel_cache.envelope.compile_ok")
-            except Exception:
+            except Exception as exc:
                 cls._envelope_kernel = False
+                _warn_metal_unavailable('ola_envelope', exc)
                 _record_cache_event("kernel_cache.envelope.compile_fail")
             return cls._envelope_kernel
 
@@ -1288,9 +1322,13 @@ def _run_metal_ola(
         batch_offsets = (mx.arange(int(B), dtype=mx.int32) * int(out_len_i))[:, None]
         scatter_indices = (batch_offsets + clipped[None, :]).reshape(-1)
 
-        out = mx.zeros((int(B) * int(out_len_i),), dtype=frames_local.dtype)
-        out = out.at[scatter_indices].add(values.reshape(-1))
-        return out.reshape(int(B), int(out_len_i))
+        # Accumulate in float32 regardless of input dtype. The Metal kernel this
+        # stands in for keeps its accumulator in `float` (see
+        # _METAL_OLA_TEMPLATE), so a half-precision accumulator here would make
+        # the result depend on whether a kernel happened to compile.
+        out = mx.zeros((int(B) * int(out_len_i),), dtype=mx.float32)
+        out = out.at[scatter_indices].add(values.reshape(-1).astype(mx.float32))
+        return out.reshape(int(B), int(out_len_i)).astype(frames_local.dtype)
 
     if frames.dtype != window.dtype:
         window = window.astype(frames.dtype)
@@ -1590,11 +1628,9 @@ def _ola_envelope_min_check_cached(
                     reusable = int(requested_length) >= int(cached_checked_length)
 
             if reusable:
-                if (not ok) and torch_like:
-                    raise RuntimeError(
-                        f"istft: window overlap-add envelope is too small "
-                        f"(cached: min={min_abs_val:.3e}); "
-                        "this matches Torch's NOLA safety intent."
+                if not ok:
+                    _report_nola_violation(
+                        min_abs_val, torch_like, cached=True, warn_key=cache_key
                     )
                 return
 
@@ -1626,13 +1662,60 @@ def _ola_envelope_min_check_cached(
         checked_len_value = int(check_length) if check_length is not None else -1
         _ola_safety_cache_set(cache_key, (ok, min_abs_val, checked_len_value))
     
-    if (not ok) and torch_like:
-        raise RuntimeError(
-            "istft: window overlap-add envelope is too small "
-            f"(min={min_abs_val:.3e}); this matches Torch's NOLA safety intent. "
-            "Try increasing win_length, using a COLA-compliant window/hop, "
-            "or disable safety checks (safety='off') if you know what you're doing."
+    if not ok:
+        _report_nola_violation(
+            min_abs_val, torch_like, cached=False, warn_key=cache_key
         )
+
+_NOLA_REMEDY = (
+    "Increase win_length, use a COLA-compliant window/hop, or pass "
+    "safety='off' to skip this check."
+)
+
+_NOLA_WARNED: set = set()
+_NOLA_WARNED_LOCK = threading.Lock()
+
+
+def _nola_violation_message(min_abs_val: float, cached: bool) -> str:
+    origin = "cached: " if cached else ""
+    return (
+        "istft: the window overlap-add envelope is degenerate "
+        f"({origin}min={min_abs_val:.3e}). Output samples where the envelope is "
+        "below 1e-11 are emitted as exact zeros, so the reconstruction will "
+        f"contain silent gaps. {_NOLA_REMEDY}"
+    )
+
+
+def _report_nola_violation(
+    min_abs_val: float,
+    torch_like: bool,
+    cached: bool,
+    warn_key=None,
+) -> None:
+    """Surface a failed NOLA check.
+
+    Previously this only raised when ``torch_like=True``, which is not the
+    default -- so by default the library computed the envelope minimum,
+    discovered the NOLA condition was violated, and returned anyway. The Metal
+    kernel and the pure-MLX fallback both emit exact 0.0 wherever the envelope
+    is below 1e-11, so a bad n_fft/hop/window combination silently punched
+    holes in the reconstructed audio with no indication of any kind. Torch
+    raises here. Now the default at least warns.
+    """
+    message = _nola_violation_message(min_abs_val, cached)
+    if torch_like:
+        raise RuntimeError(message)
+    # Warn once per transform configuration. A degenerate envelope is a
+    # property of (n_fft, hop, window, center, length), not of the call, and
+    # center=False legitimately produces zero envelope at the edges -- warning
+    # on every istft would train users to ignore it.
+    if warn_key is not None:
+        with _NOLA_WARNED_LOCK:
+            if warn_key in _NOLA_WARNED:
+                return
+            _NOLA_WARNED.add(warn_key)
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+
 
 @mx.compile
 def _torch_like_reflect_pad_1d_compiled(x: mx.array, pad: int) -> mx.array:
@@ -2145,6 +2228,34 @@ def _apply_center_padding(
     return mx.pad(x, [(0, 0), (pad_left, pad_right)], mode="constant")
 
 
+def _place_rows(
+    values: mx.array,
+    start: int,
+    width: int,
+    out_len: int,
+    B: int,
+) -> mx.array:
+    """Place ``values[:, :width]`` at column ``start`` of a zeroed ``(B, out_len)``.
+
+    Deliberately uses ``mx.slice_update`` rather than ``arr.at[:, a:b].add(...)``.
+    MLX before 0.32.0 mis-linearizes the 2-D dispatch grid in its Metal
+    ``slice_update_op_impl`` kernel (``gid.y`` is missing the ``gsize.x * NWORK``
+    factor), so a strided slice scatter-add aliases rows onto each other in a
+    non-atomic read-modify-write. That silently corrupted this adjoint for any
+    batch size greater than 1. ``mx.slice_update`` with an ``mx.array`` start
+    takes the DynamicSliceUpdate path and is exact on every supported version.
+    """
+    base = mx.zeros((B, out_len), dtype=values.dtype)
+    if width <= 0:
+        return base
+    return mx.slice_update(
+        base,
+        base[:, start:start + width] + values[:, :width],
+        mx.array([start]),
+        axes=(1,),
+    )
+
+
 def _unpad_cotangent(
     cotangent: mx.array,
     center: bool,
@@ -2157,26 +2268,16 @@ def _unpad_cotangent(
     if center:
         pad = n_fft // 2
         if length_int is not None:
-            target = length_int
-            grad_ola = mx.zeros((B, out_len), dtype=cotangent.dtype)
-            copy_len = min(target, out_len - pad, cotangent.shape[1])
-            grad_ola = grad_ola.at[:, pad:pad + copy_len].add(cotangent[:, :copy_len])
+            width = min(length_int, out_len - pad, cotangent.shape[1])
         else:
-            trimmed = out_len - 2 * pad
-            grad_ola = mx.zeros((B, out_len), dtype=cotangent.dtype)
-            actual = min(trimmed, cotangent.shape[1])
-            grad_ola = grad_ola.at[:, pad:pad + actual].add(cotangent[:, :actual])
-    elif length_int is not None:
-        target = length_int
-        grad_ola = mx.zeros((B, out_len), dtype=cotangent.dtype)
-        copy = min(target, out_len, cotangent.shape[1])
-        grad_ola = grad_ola.at[:, :copy].add(cotangent[:, :copy])
-    else:
-        grad_ola = cotangent
-        if cotangent.shape[1] < out_len:
-            grad_ola = mx.zeros((B, out_len), dtype=cotangent.dtype)
-            grad_ola = grad_ola.at[:, :cotangent.shape[1]].add(cotangent)
-    return grad_ola
+            width = min(out_len - 2 * pad, cotangent.shape[1])
+        return _place_rows(cotangent, pad, width, out_len, B)
+    if length_int is not None:
+        width = min(length_int, out_len, cotangent.shape[1])
+        return _place_rows(cotangent, 0, width, out_len, B)
+    if cotangent.shape[1] < out_len:
+        return _place_rows(cotangent, 0, cotangent.shape[1], out_len, B)
+    return cotangent
 
 
 class SpectralTransform:
@@ -2880,9 +2981,11 @@ class SpectralTransform:
             batch_offsets = (mx.arange(B, dtype=mx.int32) * out_len)[:, None]
             batch_indices = (batch_offsets + flat_indices_safe[None, :]).reshape(-1)
 
-            out_flat = mx.zeros((B * out_len,), dtype=windowed.dtype)
-            out_flat = out_flat.at[batch_indices].add(flat_vals.reshape(-1))
-            out = out_flat.reshape(B, out_len)
+            # float32 accumulator to match _METAL_OLA_NORM_TEMPLATE, which keeps
+            # `acc` in `float` even for fp16/bf16 inputs.
+            out_flat = mx.zeros((B * out_len,), dtype=mx.float32)
+            out_flat = out_flat.at[batch_indices].add(flat_vals.reshape(-1).astype(mx.float32))
+            out = out_flat.reshape(B, out_len).astype(windowed.dtype)
 
             wsq_tiled = mx.tile(window_sq.astype(mx.float32), (n_frames_int,)) * valid_mask.astype(mx.float32)
             envelope = mx.zeros((out_len,), dtype=mx.float32)
