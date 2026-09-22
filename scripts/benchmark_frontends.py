@@ -48,6 +48,41 @@ def _bench(fn, *, warmup: int, iters: int) -> float:
     return times[len(times) // 2]
 
 
+def _bench_pair(eager_fn, compiled_fn, *, warmup: int, iters: int) -> tuple[float, float]:
+    """Time two arms with the order alternating between rounds.
+
+    Measuring one arm to completion and then the other lets thermal drift,
+    allocator state and cache warmth accumulate across the block and land
+    entirely on whichever arm ran last. That is not hypothetical: it is what
+    produced the 0.56x log-mel figure in the checked-in baseline, a number that
+    does not reproduce -- the same configuration measures ~1.1x on two
+    different machines once the arms are interleaved.
+    """
+    for _ in range(warmup):
+        _eval_tree(eager_fn())
+        _eval_tree(compiled_fn())
+
+    eager_times: list[float] = []
+    compiled_times: list[float] = []
+    for i in range(iters):
+        order = (
+            (("eager", eager_fn, eager_times), ("compiled", compiled_fn, compiled_times))
+            if i % 2 == 0
+            else (("compiled", compiled_fn, compiled_times), ("eager", eager_fn, eager_times))
+        )
+        for _name, fn, bucket in order:
+            t0 = time.perf_counter()
+            _eval_tree(fn())
+            bucket.append((time.perf_counter() - t0) * 1e3)
+
+    eager_times.sort()
+    compiled_times.sort()
+    return (
+        eager_times[len(eager_times) // 2],
+        compiled_times[len(compiled_times) // 2],
+    )
+
+
 def _print_table(title: str, rows: list[dict[str, object]]) -> None:
     print(f"## {title}")
     print("| Config | eager | compiled | speedup |")
@@ -143,8 +178,8 @@ def benchmark_frontends(*, warmup: int, iters: int, emit_markdown: bool = True) 
             center_pad_mode="constant",
         )
 
-        mel_eager = _bench(lambda mel=mel, x=x: mel(x), warmup=warmup, iters=iters)
-        mel_comp = _bench(
+        mel_eager, mel_comp = _bench_pair(
+            lambda mel=mel, x=x: mel(x),
             lambda compiled=mel.get_compiled(), x=x: compiled(x),
             warmup=warmup,
             iters=iters,
@@ -153,8 +188,8 @@ def benchmark_frontends(*, warmup: int, iters: int, emit_markdown: bool = True) 
             {"label": label, "eager": mel_eager, "compiled": mel_comp, "speedup": mel_eager / mel_comp}
         )
 
-        logmel_eager = _bench(lambda tr=logmel, x=x: tr(x), warmup=warmup, iters=iters)
-        logmel_comp = _bench(
+        logmel_eager, logmel_comp = _bench_pair(
+            lambda tr=logmel, x=x: tr(x),
             lambda compiled=logmel.get_compiled(), x=x: compiled(x),
             warmup=warmup,
             iters=iters,
@@ -168,8 +203,8 @@ def benchmark_frontends(*, warmup: int, iters: int, emit_markdown: bool = True) 
             }
         )
 
-        mfcc_eager = _bench(lambda tr=mfcc, x=x: tr(x), warmup=warmup, iters=iters)
-        mfcc_comp = _bench(
+        mfcc_eager, mfcc_comp = _bench_pair(
+            lambda tr=mfcc, x=x: tr(x),
             lambda compiled=mfcc.get_compiled(), x=x: compiled(x),
             warmup=warmup,
             iters=iters,
@@ -178,8 +213,8 @@ def benchmark_frontends(*, warmup: int, iters: int, emit_markdown: bool = True) 
             {"label": label, "eager": mfcc_eager, "compiled": mfcc_comp, "speedup": mfcc_eager / mfcc_comp}
         )
 
-        filtered_eager = _bench(lambda tr=filtered, x=x: tr(x), warmup=warmup, iters=iters)
-        filtered_comp = _bench(
+        filtered_eager, filtered_comp = _bench_pair(
+            lambda tr=filtered, x=x: tr(x),
             lambda compiled=filtered.get_compiled(), x=x: compiled(x),
             warmup=warmup,
             iters=iters,
