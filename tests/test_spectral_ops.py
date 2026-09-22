@@ -157,7 +157,7 @@ class TestSTFT:
 
     def test_1d_input(self, transform):
         x = mx.random.normal((4000,))
-        z = transform.stft(x)
+        z = transform.stft(x, output_layout="bfn")
         assert z.ndim == 3
         assert z.shape[0] == 1  # batch dim added
 
@@ -170,7 +170,7 @@ class TestSTFT:
     def test_invalid_ndim(self, transform):
         x = mx.random.normal((2, 3, 4000))
         with pytest.raises(ValueError, match="1D or 2D"):
-            transform.stft(x)
+            transform.stft(x, output_layout="bfn")
 
     def test_constant_center_pad_matches_manual_symmetric_padding(self):
         n_fft = 512
@@ -483,7 +483,9 @@ class TestEdgeCases:
         """compiled_pair returns stft/istft that match eager roundtrip."""
         length = 16000
         t = SpectralTransform(n_fft=1024, hop_length=256, window_fn="hann")
-        stft_fn, istft_fn = t.compiled_pair(length=length, warmup_batch=2)
+        stft_fn, istft_fn = t.compiled_pair(
+            length=length, layout="bnf", warmup_batch=2
+        )
 
         x = mx.random.normal((2, length))
         mx.eval(x)
@@ -868,7 +870,7 @@ class TestNoGradOverhead:
         t = SpectralTransform(512, 128)
         x = mx.random.normal((2, 4096))
         mx.eval(x)
-        spec = t.stft(x)
+        spec = t.stft(x, output_layout="bfn")
         mx.eval(spec)
         # Should work fine without differentiable wrapper
         assert spec.shape[0] == 2
