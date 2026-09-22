@@ -2,6 +2,20 @@
 
 ## 0.9.0
 
+### Added
+
+- `blackman` window in `make_window`, using the classic 0.42/0.5/0.08 coefficients that
+  `numpy.blackman`, `scipy.signal` and `torch.blackman_window` all use. Honours
+  `periodic` the same way `hann` and `hamming` do; matches an analytic reference and
+  `numpy.blackman` to float32 precision (~3e-7).
+- Two-sided spectra via `onesided=False` on `SpectralTransform` and
+  `get_transform_mlx`, emitting all `n_fft` bins instead of `n_fft // 2 + 1`. Matches
+  `torch.stft(..., onesided=False)` to ~8e-6, preserves Hermitian symmetry for real
+  input, and round-trips through `istft` to ~1.5e-6. `onesided` is part of the transform
+  cache key, so one-sided and two-sided transforms of the same shape do not collide.
+  `istft` accepts either bin count and infers which it was given; the existing bin-count
+  guard now names both widths when it rejects an input.
+
 ### Fixed
 
 - **iSTFT gradients were wrong for any batch size greater than 1.** `_unpad_cotangent`,

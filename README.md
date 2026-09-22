@@ -156,7 +156,8 @@ SpectralTransform(
     n_fft: int,
     hop_length: int,
     win_length: int | None = None,
-    window_fn: str = "hann",       # "hann", "hamming", "rect"
+    window_fn: str = "hann",       # "hann", "hamming", "blackman", "rect"
+    onesided: bool = True,          # False emits full n_fft-bin FFT spectra
     window: mx.array | None = None,  # custom window array
     periodic: bool = True,
     center: bool = True,

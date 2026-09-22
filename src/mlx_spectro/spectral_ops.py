@@ -1672,9 +1672,6 @@ _NOLA_REMEDY = (
     "safety='off' to skip this check."
 )
 
-_NOLA_WARNED: set = set()
-_NOLA_WARNED_LOCK = threading.Lock()
-
 
 def _nola_violation_message(min_abs_val: float, cached: bool) -> str:
     origin = "cached: " if cached else ""
@@ -1684,6 +1681,10 @@ def _nola_violation_message(min_abs_val: float, cached: bool) -> str:
         "below 1e-11 are emitted as exact zeros, so the reconstruction will "
         f"contain silent gaps. {_NOLA_REMEDY}"
     )
+
+
+_NOLA_WARNED: set = set()
+_NOLA_WARNED_LOCK = threading.Lock()
 
 
 def _report_nola_violation(
@@ -1771,6 +1772,9 @@ def make_window(
         w = 0.5 - 0.5 * mx.cos(2.0 * math.pi * idx / denom)
     elif window_fn == "hamming":
         w = 0.54 - 0.46 * mx.cos(2.0 * math.pi * idx / denom)
+    elif window_fn == "blackman":
+        theta = 2.0 * math.pi * idx / denom
+        w = 0.42 - 0.5 * mx.cos(theta) + 0.08 * mx.cos(2.0 * theta)
     elif window_fn in ("rect", "boxcar", "ones"):
         w = mx.ones((win_length,), dtype=mx.float32)
     else:
@@ -2142,6 +2146,7 @@ class _TransformKey:
     hop_length: int
     win_length: int
     window_fn: str
+    onesided: bool
     periodic: bool
     center: bool
     center_pad_mode: str
@@ -2287,6 +2292,7 @@ class SpectralTransform:
     """
     __slots__ = (
         'n_fft', 'hop_length', 'win_length', 'window', 'window_fn',
+        'onesided',
         '_window_sq', 'center', 'center_pad_mode', 'center_tail_pad',
         'normalized', 'periodic',
         'istft_backend_policy',
@@ -2304,6 +2310,7 @@ class SpectralTransform:
         win_length: Optional[int] = None,
         window_fn: str = "hann",
         *,
+        onesided: bool = True,
         window: WindowLike = None,
         periodic: bool = True,
         center: bool = True,
@@ -2325,6 +2332,7 @@ class SpectralTransform:
         self.normalized = bool(normalized)
         self.periodic = bool(periodic)
         self.window_fn = str(window_fn)
+        self.onesided = bool(onesided)
         if self.center_pad_mode not in {"reflect", "constant"}:
             raise ValueError(
                 "center_pad_mode must be one of {'reflect', 'constant'}"
@@ -2701,7 +2709,7 @@ class SpectralTransform:
 
         When Metal is available, uses a fused frame-extraction kernel for the
         forward pass and a dedicated Metal scatter-add kernel for the backward
-        pass.  Falls back to pure MLX ops (``as_strided`` / ``rfft``) on both
+        pass.  Falls back to pure MLX ops (``as_strided`` / FFT) on both
         paths when Metal is unavailable.
 
         .. note:: **Performance** — The backward pass is ~4-5x slower than
@@ -2818,8 +2826,11 @@ class SpectralTransform:
             )
             frames = frames * window[None, None, :]
 
-        # --- rfft (natively differentiable) ---
-        spec = mx.fft.rfft(frames, axis=-1)
+        # --- FFT (natively differentiable) ---
+        if self.onesided:
+            spec = mx.fft.rfft(frames, axis=-1)
+        else:
+            spec = mx.fft.fft(frames, axis=-1)
 
         # --- normalization (differentiable) ---
         if self.normalized:
@@ -2873,9 +2884,24 @@ class SpectralTransform:
         B, n_frames, freq_bins = z.shape
         n_frames_int = int(n_frames)
         out_len = hop_length * (n_frames_int - 1) + n_fft
+        onesided_bins = int(n_fft // 2 + 1)
+        twosided_bins = int(n_fft)
+        if int(freq_bins) not in (onesided_bins, twosided_bins):
+            raise ValueError(
+                "differentiable_istft expects frequency bins in the last axis "
+                f"with size {onesided_bins} (onesided) or {twosided_bins} "
+                f"(dualsided); got {int(freq_bins)}"
+            )
+        is_onesided_input = (
+            int(freq_bins) == onesided_bins
+            and (onesided_bins != twosided_bins or self.onesided)
+        )
 
-        # --- Step 1: irfft (natively differentiable) ---
-        time_frames = mx.fft.irfft(z, n=n_fft, axis=-1)  # [B, N, n_fft]
+        # --- Step 1: iFFT (natively differentiable) ---
+        if is_onesided_input:
+            time_frames = mx.fft.irfft(z, n=n_fft, axis=-1)  # [B, N, n_fft]
+        else:
+            time_frames = mx.fft.ifft(z, axis=-1).real  # [B, N, n_fft]
 
         # --- Step 2: normalization (differentiable) ---
         if self.normalized:
@@ -3191,7 +3217,10 @@ class SpectralTransform:
                     outputs = None
 
             if outputs is not None:
-                spec = mx.fft.rfft(outputs[0], axis=-1)
+                if self.onesided:
+                    spec = mx.fft.rfft(outputs[0], axis=-1)
+                else:
+                    spec = mx.fft.fft(outputs[0], axis=-1)
                 if self.normalized:
                     spec = spec * self._inv_norm_factor
                 if resolved_layout == "bnf":
@@ -3230,7 +3259,10 @@ class SpectralTransform:
         frames = frames * self.window
 
         # FFT (Real -> Complex)
-        spec = mx.fft.rfft(frames, axis=-1)
+        if self.onesided:
+            spec = mx.fft.rfft(frames, axis=-1)
+        else:
+            spec = mx.fft.fft(frames, axis=-1)
 
         if self.normalized:
             spec = spec * self._inv_norm_factor
@@ -3328,6 +3360,10 @@ class SpectralTransform:
                     "If your input is [B, F, N], pass input_layout='bfn'."
                 )
             z_bnf = z
+        is_onesided_input = (
+            int(freq_bins) == onesided_bins
+            and (onesided_bins != twosided_bins or self.onesided)
+        )
 
         if self.center:
             if self.center_tail_pad == "minimal":
@@ -3393,9 +3429,14 @@ class SpectralTransform:
                 z_np = np.asarray(z_bnf)
                 # NumPy's IRFFT tracks torch.fft.irfft closely for these inputs and
                 # avoids amplified tail drift in center+long reconstruction.
-                time_frames_np = np.fft.irfft(
-                    z_np, n=self.n_fft, axis=-1,
-                ).astype(np.float32, copy=False)
+                if is_onesided_input:
+                    time_frames_np = np.fft.irfft(
+                        z_np, n=self.n_fft, axis=-1,
+                    ).astype(np.float32, copy=False)
+                else:
+                    time_frames_np = np.fft.ifft(
+                        z_np, axis=-1,
+                    ).real.astype(np.float32, copy=False)
                 time_frames = mx.array(time_frames_np, dtype=mx.float32)
             except Exception as err:
                 warnings.warn(
@@ -3404,11 +3445,18 @@ class SpectralTransform:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                time_frames = mx.fft.irfft(z_bnf, n=self.n_fft, axis=-1)
+                if is_onesided_input:
+                    time_frames = mx.fft.irfft(z_bnf, n=self.n_fft, axis=-1)
+                else:
+                    time_frames = mx.fft.ifft(z_bnf, axis=-1).real
         else:
             # iFFT (Complex -> Real)
-            _record_cache_event("backend_policy.route.mlx_irfft")
-            time_frames = mx.fft.irfft(z_bnf, n=self.n_fft, axis=-1)
+            if is_onesided_input:
+                _record_cache_event("backend_policy.route.mlx_irfft")
+                time_frames = mx.fft.irfft(z_bnf, n=self.n_fft, axis=-1)
+            else:
+                _record_cache_event("backend_policy.route.mlx_ifft")
+                time_frames = mx.fft.ifft(z_bnf, axis=-1).real
         
         if self.normalized:
             time_frames = time_frames * self._norm_factor
@@ -7989,6 +8037,7 @@ def _get_transform_cached(key: _TransformKey) -> SpectralTransform:
         hop_length=key.hop_length,
         win_length=key.win_length,
         window_fn=key.window_fn,
+        onesided=key.onesided,
         periodic=key.periodic,
         center=key.center,
         center_pad_mode=key.center_pad_mode,
@@ -8007,6 +8056,7 @@ def get_transform_mlx(
     center: bool,
     normalized: bool,
     window: WindowLike,
+    onesided: bool = True,
     center_pad_mode: CenterPadMode = "reflect",
     center_tail_pad: CenterTailPad = "symmetric",
     istft_backend_policy: Optional[str] = None,
@@ -8022,6 +8072,7 @@ def get_transform_mlx(
             hop_length=hop_length,
             win_length=win_length,
             window_fn=window_fn,
+            onesided=onesided,
             window=window,
             periodic=periodic,
             center=center,
@@ -8036,6 +8087,7 @@ def get_transform_mlx(
         hop_length=int(hop_length),
         win_length=int(win_length),
         window_fn=str(window_fn),
+        onesided=bool(onesided),
         periodic=bool(periodic),
         center=bool(center),
         center_pad_mode=str(center_pad_mode),

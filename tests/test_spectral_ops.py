@@ -69,6 +69,14 @@ class TestMakeWindow:
         # Hamming doesn't go to zero
         assert float(w[0].item()) > 0.05
 
+    def test_blackman(self):
+        w = make_window(None, "blackman", 256, 256, True)
+        assert w.shape == (256,)
+        assert w.dtype == mx.float32
+        idx = np.arange(256, dtype=np.float32)
+        expected = 0.42 - 0.5 * np.cos(2.0 * np.pi * idx / 256) + 0.08 * np.cos(4.0 * np.pi * idx / 256)
+        np.testing.assert_allclose(np.array(w), expected, atol=1e-6)
+
     def test_rect(self):
         w = make_window(None, "rect", 128, 128, True)
         assert w.shape == (128,)
@@ -122,11 +130,42 @@ class TestSTFT:
         assert B == 2
         assert F == 512 // 2 + 1
 
+    def test_twosided_output_shape(self):
+        t = SpectralTransform(n_fft=512, hop_length=128, window_fn="hann", onesided=False)
+        x = mx.random.normal((2, 8000))
+        z_bfn = t.stft(x, output_layout="bfn")
+        z_bnf = t.stft(x, output_layout="bnf")
+        assert z_bfn.shape[0] == 2
+        assert z_bfn.shape[1] == 512
+        assert z_bfn.shape[2] > 0
+        assert z_bnf.shape == (2, z_bfn.shape[2], 512)
+
+    def test_twosided_matches_onesided_positive_frequencies(self):
+        x = mx.random.normal((1, 4000))
+        base = dict(n_fft=512, hop_length=128, window_fn="hann")
+        one = SpectralTransform(**base, onesided=True)
+        two = SpectralTransform(**base, onesided=False)
+        z_one = one.stft(x, output_layout="bfn")
+        z_two = two.stft(x, output_layout="bfn")
+        mx.eval(z_one, z_two)
+        np.testing.assert_allclose(
+            np.array(z_two[:, : 512 // 2 + 1, :]),
+            np.array(z_one),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
     def test_1d_input(self, transform):
         x = mx.random.normal((4000,))
         z = transform.stft(x)
         assert z.ndim == 3
         assert z.shape[0] == 1  # batch dim added
+
+    def test_blackman_window_fn(self):
+        t = SpectralTransform(n_fft=512, hop_length=128, window_fn="blackman")
+        x = mx.random.normal((1, 4000))
+        z = t.stft(x, output_layout="bfn")
+        assert z.shape[1] == 257
 
     def test_invalid_ndim(self, transform):
         x = mx.random.normal((2, 3, 4000))
@@ -245,6 +284,18 @@ class TestISTFTRoundtrip:
             np.array(y), np.array(x), atol=1e-4, rtol=1e-4
         )
 
+    def test_twosided_roundtrip(self):
+        t = SpectralTransform(n_fft=512, hop_length=128, window_fn="hann", onesided=False)
+        length = 8000
+        x = mx.random.normal((2, length))
+        z = t.stft(x, output_layout="bnf")
+        assert z.shape[-1] == 512
+        y = t.istft(z, length=length, input_layout="bnf")
+        mx.eval(y)
+        np.testing.assert_allclose(
+            np.array(y), np.array(x), atol=1e-4, rtol=1e-4
+        )
+
     def test_batch(self):
         t = SpectralTransform(n_fft=512, hop_length=128, window_fn="hann")
         length = 4000
@@ -323,6 +374,23 @@ class TestGetTransformCached:
         )
         t1 = get_transform_mlx(**{**base, "center_pad_mode": "reflect"})
         t2 = get_transform_mlx(**{**base, "center_pad_mode": "constant"})
+        assert t1 is not t2
+
+    def test_different_onesided_config_not_cached(self):
+        base = dict(
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            window_fn="hann",
+            periodic=True,
+            center=True,
+            center_pad_mode="reflect",
+            center_tail_pad="symmetric",
+            normalized=False,
+            window=None,
+        )
+        t1 = get_transform_mlx(**{**base, "onesided": True})
+        t2 = get_transform_mlx(**{**base, "onesided": False})
         assert t1 is not t2
 
 
@@ -451,6 +519,23 @@ class TestEdgeCases:
         y = istft_fn(z)
         mx.eval(y)
 
+        np.testing.assert_allclose(
+            np.array(y), np.array(x), atol=1e-4, rtol=1e-4,
+        )
+
+    def test_twosided_compiled_pair_roundtrip(self):
+        """compiled_pair works when STFT emits a full two-sided spectrum."""
+        length = 8000
+        t = SpectralTransform(n_fft=512, hop_length=128, window_fn="hann", onesided=False)
+        stft_fn, istft_fn = t.compiled_pair(length=length, layout="bnf")
+
+        x = mx.random.normal((1, length))
+        mx.eval(x)
+        z = stft_fn(x)
+        y = istft_fn(z)
+        mx.eval(z, y)
+
+        assert z.shape[-1] == 512
         np.testing.assert_allclose(
             np.array(y), np.array(x), atol=1e-4, rtol=1e-4,
         )
