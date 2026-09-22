@@ -649,6 +649,27 @@ Use the eager `t.stft()` / `t.istft()` methods when input shapes vary.
 | `SPEC_MLX_AUTOTUNE_CACHE_PATH` | — | Override autotune cache file path |
 | `MLX_OLA_FUSE_NORM` | `1` | Enable fused OLA+normalization kernel |
 | `SPEC_MLX_CACHE_STATS` | `0` | Enable cache debug counters |
+| `SPEC_MLX_AUTOTUNE_MAX_ENTRIES` | `500` | Cap on persisted autotune entries |
+| `SPEC_MLX_OLA_SAFETY_LENGTH_STRATEGY` | `bucket` | Cache-key granularity for the NOLA check. Buckets only the key, never the checked span. |
+| `SPEC_MLX_OLA_SAFETY_LENGTH_BUCKET` | `2048` | Bucket width for the above |
+
+**Every default above is already the best setting** — each is either the
+fastest option, the most accurate, or both (`MLX_OLA_FUSE_NORM=1` is both: the
+fused kernel accumulates in `float32` and divides once, where the two-pass
+fallback materializes the sum first). You should not need to set any of them.
+
+Note that most are read into module-level constants at import, so setting
+`os.environ[...]` after `import mlx_spectro` has no effect.
+
+## Warnings
+
+The library warns rather than failing silently in two cases. Neither is noise;
+each means output you would otherwise trust is not what you expect.
+
+| Warning | Means |
+|---|---|
+| `istft: the window overlap-add envelope is degenerate` | Your `n_fft`/`hop_length`/`window` combination violates NOLA, so samples where the envelope falls below `1e-11` are emitted as exact zeros — the reconstruction has silent gaps. Raised as an error under `torch_like=True`, matching Torch. Emitted once per transform configuration. `center=False` triggers it legitimately, because the first and last `n_fft` samples are never fully covered. |
+| `mlx-spectro: Metal kernel ... failed to compile` | Metal is unavailable or the kernel was rejected, so the pure-MLX path is being used instead: slower, and rounds differently. Emitted once per process. |
 
 ## License
 
