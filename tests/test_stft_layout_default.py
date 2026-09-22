@@ -117,3 +117,31 @@ class TestResolver:
         out = istft_fn(z)
         mx.eval(out)
         assert out.shape == signal.shape
+
+
+class TestCompiledPairIsInferenceOnly:
+    """The compiled callables wrap custom Metal kernels, which have no VJP.
+
+    This fails loudly rather than silently returning a wrong gradient, but it
+    is worth pinning: anyone migrating a training loop to compiled_pair for the
+    speedup needs to hit this in their tests, not in a slow-converging run.
+    """
+
+    def test_grad_through_compiled_pair_raises(self, transform, signal):
+        stft_fn, istft_fn = transform.compiled_pair(length=LENGTH, warmup_batch=2)
+
+        def loss(x):
+            return mx.sum(istft_fn(stft_fn(x)) ** 2)
+
+        with pytest.raises(ValueError, match="vjp"):
+            mx.eval(mx.grad(loss)(signal))
+
+    def test_the_differentiable_entry_points_do_work(self, transform, signal):
+        def loss(x):
+            spec = transform.differentiable_stft(x)
+            return mx.sum(transform.differentiable_istft(spec, length=LENGTH) ** 2)
+
+        g = mx.grad(loss)(signal)
+        mx.eval(g)
+        assert g.shape == signal.shape
+        assert bool(mx.isfinite(g).all().item())

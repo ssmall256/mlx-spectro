@@ -178,7 +178,7 @@ SpectralTransform(
 
 - `stft(x, output_layout="bfn")` — Forward STFT. Input: `[T]` or `[B, T]`.
 - `istft(z, length=None, validate=False, *, torch_like=False, allow_fused=True, safety="auto", long_mode_strategy="native", backend_policy=None, input_layout="bfn")` — Inverse STFT. Returns `[B, T]`.
-- `compiled_pair(length, layout="bfn", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (10–20% faster).
+- `compiled_pair(length, layout="bfn", warmup_batch=None)` — Return compiled `(stft_fn, istft_fn)` for steady-state loops (measured 1.1–1.6x on per-chunk round trips; the win is removed Python dispatch, so it scales with call count, not sample count). **Inference only** — `mx.grad` through these raises; use `differentiable_stft`/`differentiable_istft` for gradients.
 - `compiled_pair_nd(length, leading_shape, layout="bfn")` — Return compiled reshape-aware `(stft_fn, istft_fn)` for fixed multi-axis inputs such as `[B, C, T]`.
 - `warmup(batch=1, length=4096)` — Force kernel compilation.
 - `prewarm_kernels(batch=1, length=None)` — Precompile eager STFT plus fused and legacy iSTFT kernels.

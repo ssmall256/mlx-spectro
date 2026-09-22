@@ -2607,6 +2607,12 @@ class SpectralTransform:
                 z = process(z)
                 y = istft(z)
                 mx.eval(y)
+
+        Inference only. The compiled callables wrap custom Metal kernels,
+        which have no VJP, so ``mx.grad`` through them raises
+        ``[Primitive::vjp] Not implemented for CustomKernel``. Use
+        :meth:`differentiable_stft` / :meth:`differentiable_istft` when
+        gradients must flow through the transform.
         """
         resolved_layout = _resolve_stft_output_layout(layout)
 
