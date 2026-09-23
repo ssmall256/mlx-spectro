@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.2
+
+### Fixed
+
+- **A compiled `stft` or `istft` raised on a machine with no tuning cache yet.**
+  Threadgroup autotuning picks a size by timing candidates, and every timing run
+  calls `mx.eval`, which MLX refuses inside `mx.compile` or `vmap`. Every
+  candidate therefore failed for the same reason and 0.9.0's "no usable
+  threadgroup size" error fired -- correct for a kernel that genuinely does not
+  run, wrong when the only problem is that timing is impossible. Tuning is now
+  skipped under a trace: the call runs at the default threadgroup size, warns
+  once per `(kernel, n_fft, hop)`, and records nothing, so a later eager call
+  still measures and caches a real value. Affected `mx.compile` around `stft` or
+  `istft`, `get_compiled_stft` and `get_compiled_istft`;
+  `compiled_pair`/`compiled_pair_nd` were never affected, because they call the
+  transform eagerly once before compiling -- which is also the remedy the
+  warning names.
+
 ## 0.9.1
 
 ### Changed

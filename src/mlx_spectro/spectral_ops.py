@@ -785,6 +785,54 @@ def _warn_metal_unavailable(kernel_name: str, error: BaseException) -> None:
     )
 
 
+_TRACED_AUTOTUNE_WARNED: set = set()
+_TRACED_AUTOTUNE_WARNED_LOCK = threading.Lock()
+
+# MLX raises from mx.eval when a trace is active. The message is the only
+# signal it gives -- there is no public "am I being traced" predicate (mx.trace
+# is the linear-algebra one), and the exception type has changed between MLX
+# releases, so match on the text.
+_TRACER_ERROR_MARKERS = (
+    "during function transformations",
+    "Attempting to eval an array during",
+)
+
+
+def _is_tracer_error(error: BaseException) -> bool:
+    """True when `error` is MLX refusing an eval inside compile/vmap."""
+    text = str(error)
+    return any(marker in text for marker in _TRACER_ERROR_MARKERS)
+
+
+def _warn_autotune_skipped_under_trace(
+    kernel_name: str, n_fft: int, hop: int, default_tgx: int
+) -> None:
+    """Warn once per (kernel, n_fft, hop) that tuning was skipped.
+
+    Autotuning times candidates with mx.eval, which MLX forbids inside
+    mx.compile or vmap. Under a trace there is nothing to time, so the tuned
+    value cannot be measured and must not be cached -- an untested entry would
+    then be served to the eager path too. The default runs correctly; it is
+    only unmeasured. Calling the transform once eagerly before compiling
+    populates the cache and removes both the warning and the guess.
+    """
+    key = (str(kernel_name), int(n_fft), int(hop))
+    with _TRACED_AUTOTUNE_WARNED_LOCK:
+        if key in _TRACED_AUTOTUNE_WARNED:
+            return
+        _TRACED_AUTOTUNE_WARNED.add(key)
+    warnings.warn(
+        f"mlx-spectro: threadgroup autotuning for {kernel_name!r} "
+        f"(n_fft={n_fft}, hop={hop}) was skipped because the call is inside "
+        f"mx.compile or vmap, where timing runs are not possible. Using the "
+        f"untuned default threadgroup.x={default_tgx}; results are correct "
+        f"but may be slower. Call the transform once outside the compiled "
+        f"function to tune and cache it.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
 class _PowerSpectrumCache:
     """Singleton for the fused power-spectrum Metal kernel."""
     _lock = threading.Lock()
@@ -1201,10 +1249,17 @@ class _KernelCache:
 
         # Benchmark candidate tg sizes; skip invalid ones gracefully.
         first_error: Exception | None = None
+        traced = False
         for tgx in benchmark_candidates:
             try:
                 dt = _time_one(tgx)
             except Exception as exc:
+                if _is_tracer_error(exc):
+                    # Inside mx.compile/vmap every candidate fails the same
+                    # way, so stop rather than repeating it 14 times.
+                    traced = True
+                    first_error = exc
+                    break
                 if first_error is None:
                     first_error = exc
                 continue
@@ -1212,6 +1267,12 @@ class _KernelCache:
             if best_time is None or dt < best_time:
                 best_time = dt
                 best_tgx = tgx
+
+        if traced:
+            _warn_autotune_skipped_under_trace(
+                kernel_name, int(n_fft), int(hop), int(clamped_default_tgx)
+            )
+            return int(clamped_default_tgx)
 
         if best_time is None:
             # Every candidate failed, so the kernel itself is broken for this
