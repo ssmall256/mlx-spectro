@@ -53,9 +53,28 @@
   so a change to one — or a regression — would have shipped green.
 
 - Minimum MLX raised to 0.31.2, matching the rest of the MLX audio stack.
+- **`istft()` raised for any configuration with `hop_length > n_fft`.** 0.8.0 made
+  the Metal unroll factor a computed template constant, `min(FRAME/HOP, 8)`, which
+  is 0 when the hop exceeds the frame. Metal rejects `#pragma unroll 0`, so all
+  three iSTFT kernels failed to build and the call raised
+  `Unable to build metal library from source`. Non-overlapping frames are unusual
+  but legal and worked in 0.7.0. Clamped to 1; output is bit-identical to 0.7.0 at
+  every frame/hop combination tested.
+- The kernel autotuner cached an untested default and returned successfully when
+  every candidate threadgroup size failed, so a broken kernel surfaced later from an
+  unrelated line. That is what turned the unroll bug above into a mysterious
+  `istft` crash. It now raises, naming the kernel and the configuration, and caches
+  nothing.
 
 ### Tests
 
+- CI installs a new `parity` extra (librosa, torch, torchaudio, scipy, soxr). It
+  previously installed only `dev`, so all 22 cross-framework parity tests skipped
+  and the suite was green whether or not parity held. `test_librosa_cqt.py` — the
+  only coverage the new VQT has — never executed anywhere, and
+  `mel_filterbank_librosa` shipped with no test at all.
+- `hop_length > n_fft` reconstruction, and `_unroll_k` clamping across the
+  frame/hop matrix.
 - Batched finite-difference gradient checks for `differentiable_istft` at B ∈ {1, 2, 4},
   plus a per-sample independence invariant. The previous suite checked gradients densely
   only at B=1 and asserted merely shape and finiteness at B=4, so it passed with garbage.
@@ -69,7 +88,31 @@
 
 - librosa-compatible VQT/CQT (MLX-native), `mel_filterbank_librosa`, madmom-compat
   presets and onset ODF helpers, `nnaudio_cqt_kernels`, and spectral feature frontends.
-  (This release was tagged without a changelog entry; recorded here retroactively.)
+  59 new names at package level; nothing was removed or renamed.
+  (Recorded here retroactively. 0.8.0 was never tagged or published, so these
+  changes reach PyPI for the first time in 0.9.0.)
+- `vqt` and `build_vqt_plan` cover the parameter sets that need no early
+  downsampling, and raise `NotImplementedError` otherwise — `sr=44100` with
+  `hop_length=512`, `n_bins=84`, `bins_per_octave=12` is one that does. Use
+  `hybrid_cqt` for the general case. `vqt` takes a 1-D signal, not a batch.
+- Two mel filterbanks now exist and they are not interchangeable:
+  `mel_filterbank` (madmom convention, area-normalized) and
+  `mel_filterbank_librosa` (librosa convention). Filter magnitudes differ by
+  roughly 87x, about 19 dB. Note `mel_filterbank_librosa` defaults to
+  `htk=True` while `librosa.filters.mel` defaults to `htk=False`, so passing
+  defaults on both sides does not match.
+
+### Changed
+
+- `SpectralTransform.istft` now emits a `DeprecationWarning` for
+  `long_mode_strategy` values other than `"native"` and for
+  `backend_policy="torch_fallback"`. Both paths still run unchanged; only the
+  warning is new.
+- iSTFT Metal kernels take the unroll factor from the overlap ratio
+  (`UNROLL_K`) instead of a fixed literal, and the STFT frame-extract kernel
+  autotunes its threadgroup size on first use per `(kernel, n_fft, hop)`,
+  caching the result to disk. First call on a cold cache is slower; steady
+  state is not.
 
 
 ## 0.7.0

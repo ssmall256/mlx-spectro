@@ -33,6 +33,19 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch>=2.0"]
 dev = ["pytest>=7.0", "build"]
+# The cross-framework parity tests are the only thing that validates the
+# librosa/torchaudio-compatible surfaces against their references. Without
+# these they are skipped, and a suite that skips them is green whether or not
+# the parity holds -- which is how `mel_filterbank_librosa` shipped with no
+# executed test at all. Install this extra in CI, not `dev`.
+parity = [
+    "pytest>=7.0",
+    "librosa>=0.10",
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "scipy>=1.10",
+    "soxr>=0.3",
+]
 benchmark = ["torch>=2.0", "mlx-stft"]
 
 [project.urls]

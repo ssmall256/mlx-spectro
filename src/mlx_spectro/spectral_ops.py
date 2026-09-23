@@ -463,7 +463,23 @@ int k_min = 0;
 # kernel recompilation for every unique audio length.
 # UNROLL_K is a compile-time template constant = min(FRAME/HOP, 8), matching
 # the overlap ratio so the compiler can fully unroll common cases (e.g. 4 for
-# standard 4× overlap, 8 for high-overlap configs).
+# standard 4× overlap, 8 for high-overlap configs). See _unroll_k for why it is
+# clamped below.
+def _unroll_k(frame: int, hop: int) -> int:
+    """Overlap ratio for `#pragma unroll UNROLL_K`, clamped to a legal value.
+
+    A hop larger than the frame is a legitimate, if unusual, configuration --
+    frames simply do not overlap -- and integer division then yields 0. Metal
+    rejects `#pragma unroll 0` outright ("invalid value '0'; must be positive"),
+    so the kernel fails to build and istft raises instead of reconstructing.
+    Clamping to 1 restores the pre-0.8 behaviour, where the pragma was a
+    literal.
+    """
+    if hop <= 0:
+        return 1
+    return max(1, min(frame // hop, 8))
+
+
 _METAL_OLA_TEMPLATE = """
 int n_frames = params[0];
 int out_len = params[1];
@@ -1184,15 +1200,32 @@ class _KernelCache:
         best_time = None
 
         # Benchmark candidate tg sizes; skip invalid ones gracefully.
+        first_error: Exception | None = None
         for tgx in benchmark_candidates:
             try:
                 dt = _time_one(tgx)
-            except Exception:
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 continue
-            
+
             if best_time is None or dt < best_time:
                 best_time = dt
                 best_tgx = tgx
+
+        if best_time is None:
+            # Every candidate failed, so the kernel itself is broken for this
+            # configuration -- not a tuning question. Caching the untested
+            # default would hide that and let the real failure surface later
+            # from an unrelated line, which is how a `#pragma unroll 0` build
+            # error once read as a mysterious istft crash. Surface it here and
+            # cache nothing.
+            raise RuntimeError(
+                f"{kernel_name}: no usable threadgroup size for n_fft={n_fft}, "
+                f"hop={hop} -- every candidate of "
+                f"{benchmark_candidates} failed to run. "
+                f"First error: {first_error}"
+            ) from first_error
 
         # Persist result.
         cls.set_threadgroup_x(device_key, kernel_name, n_fft, hop, best_tgx)
@@ -1346,7 +1379,7 @@ def _run_metal_ola(
     window = mx.contiguous(window)
 
     params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
-    unroll_k = min(frame // hop, 8) if hop > 0 else 1
+    unroll_k = _unroll_k(frame, hop)
     tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("UNROLL_K", unroll_k)]
     _record_tmpl_event("ola", tmpl)
 
@@ -1453,7 +1486,7 @@ def _run_metal_ola_norm(
     window_sq = mx.contiguous(window_sq)
 
     params = mx.array([int(nframe), int(out_len)], dtype=mx.int32)
-    unroll_k = min(frame // hop, 8) if hop > 0 else 1
+    unroll_k = _unroll_k(frame, hop)
     tmpl = [("T", frames.dtype), ("HOP", hop), ("FRAME", frame), ("UNROLL_K", unroll_k)]
     _record_tmpl_event("ola_norm", tmpl)
 
@@ -2928,7 +2961,7 @@ class SpectralTransform:
             envelope_kernel = _KernelCache.get_envelope()
             if envelope_kernel and envelope_kernel is not False:
                 env_params = mx.array([n_frames_int, out_len], dtype=mx.int32)
-                env_unroll_k = min(n_fft // hop_length, 8) if hop_length > 0 else 1
+                env_unroll_k = _unroll_k(n_fft, hop_length)
                 env_tmpl = [("T", mx.float32), ("HOP", hop_length), ("FRAME", n_fft), ("UNROLL_K", env_unroll_k)]
                 env_grid = (out_len, 1, 1)
                 env_tgx = _KernelCache.autotune_threadgroup_x(
@@ -3083,7 +3116,7 @@ class SpectralTransform:
             return denom, denom_inv
             
         params = mx.array([int(n_frames), int(out_len)], dtype=mx.int32)
-        env_unroll_k = min(self.n_fft // self.hop_length, 8) if self.hop_length > 0 else 1
+        env_unroll_k = _unroll_k(self.n_fft, self.hop_length)
         tmpl = [
             ("T", window_sq.dtype), ("HOP", self.hop_length),
             ("FRAME", self.n_fft), ("UNROLL_K", env_unroll_k),
