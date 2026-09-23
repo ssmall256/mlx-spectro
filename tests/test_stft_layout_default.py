@@ -80,7 +80,7 @@ class TestEveryEntryPointDefaultsToBfn:
 
 
 class TestCompiledMatchesEager:
-    """AGENTS.md: compiled callables must produce identical results to eager."""
+    """Compiled callables must produce identical results to eager."""
 
     def test_default_compiled_pair_matches_default_eager(self, transform, signal):
         import numpy as np

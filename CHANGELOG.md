@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.5
+
+### Removed
+
+- Local tooling notes no longer ship in the sdist, and `.gitignore` keeps them
+  out of the repository.
+
 ## 0.9.4
 
 ### Fixed
