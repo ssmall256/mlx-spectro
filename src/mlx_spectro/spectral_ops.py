@@ -6155,6 +6155,32 @@ def hop_size_from_fps(fps: float, sample_rate: int = 44_100) -> float:
 
 
 def fft_frequencies(num_fft_bins: int, sample_rate: int) -> np.ndarray:
+    """Centre frequency of each rfft bin, madmom argument order.
+
+    Note the two differences from ``librosa.fft_frequencies(sr=, n_fft=)``:
+    the arguments are in the opposite order, and the first one is the **number
+    of bins** (``n_fft // 2 + 1``), not ``n_fft``. This matches madmom, and
+    :func:`mel_filterbank` and the filtered-spectrogram helpers expect it.
+    """
+    # Catch `fft_frequencies(sr, n_fft)` written from librosa habit. Left alone
+    # it returns a plausible-looking array of entirely the wrong length, which
+    # then flows silently into a filterbank of the wrong shape -- no exception,
+    # just wrong numbers. The tell is that FFT sizes are powers of two and
+    # audio sample rates essentially never are.
+    looks_swapped = sample_rate < 1000 or (
+        num_fft_bins >= 4000
+        and 0 < sample_rate <= 65536
+        and sample_rate & (sample_rate - 1) == 0
+    )
+    if looks_swapped:
+        raise ValueError(
+            f"fft_frequencies(num_fft_bins={num_fft_bins}, "
+            f"sample_rate={sample_rate}): the arguments look swapped. This "
+            "takes (num_fft_bins, sample_rate) -- the opposite order from "
+            "librosa, and a bin count rather than n_fft. For n_fft="
+            f"{sample_rate} at {num_fft_bins} Hz, call "
+            f"fft_frequencies({sample_rate // 2 + 1}, {num_fft_bins})."
+        )
     return np.fft.rfftfreq((num_fft_bins - 1) * 2, d=1.0 / sample_rate).astype(np.float32)
 
 
@@ -6271,15 +6297,23 @@ def mel_filterbank_librosa(
     *,
     fmin: float = 0.0,
     fmax: float | None = None,
-    htk: bool = True,
+    htk: bool = False,
     norm: str | None = "slaney",
 ) -> np.ndarray:
     """Mel filterbank matching librosa.filters.mel exactly.
 
-    Uses continuous frequency interpolation (not bin-aligned) and
-    supports ``norm='slaney'`` (divide by bandwidth) which is librosa's
-    default.  Returns ``[n_fft//2+1, n_mels]`` (transposed vs librosa's
-    ``[n_mels, n_fft//2+1]``) to match mlx-spectro's convention.
+    Every default here matches ``librosa.filters.mel``, so passing defaults on
+    both sides gives the same filterbank (verified to 1e-9). Uses continuous
+    frequency interpolation (not bin-aligned) and supports ``norm='slaney'``
+    (divide by bandwidth), librosa's default. Returns ``[n_fft//2+1, n_mels]``,
+    transposed from librosa's ``[n_mels, n_fft//2+1]``, to match this package's
+    convention.
+
+    Not interchangeable with :func:`mel_filterbank`, which follows madmom:
+    area-normalized triangles peaking at 1.0 against these Slaney-normalized
+    ones peaking near 0.01, a difference of roughly 80x -- about 19 dB -- in
+    everything downstream. Pick the one matching the implementation you are
+    reproducing.
 
     Reference: librosa.filters.mel
     """

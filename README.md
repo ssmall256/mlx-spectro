@@ -348,18 +348,28 @@ Filter magnitudes differ between them by roughly **87x** — about 19 dB — so
 swapping one for the other silently changes every downstream level. Pick the one
 matching the reference implementation you are reproducing.
 
-Two gotchas on `mel_filterbank_librosa`: it takes a sample rate and FFT size
-where `mel_filterbank` takes precomputed bin frequencies, and it defaults to
-`htk=True` while `librosa.filters.mel` defaults to `htk=False`. Passing defaults
-on both sides does **not** give you matching filterbanks — pass `htk=False` for
-librosa's default behaviour.
+`mel_filterbank_librosa` matches `librosa.filters.mel` on every default, so
+passing defaults on both sides agrees to 1e-9. It differs from `mel_filterbank`
+only in taking a sample rate and FFT size where the latter takes precomputed bin
+frequencies.
+
+### `fft_frequencies` argument order
+
+```python
+fft_frequencies(num_fft_bins, sample_rate)   # madmom order, bins not n_fft
+librosa.fft_frequencies(sr=..., n_fft=...)   # opposite order, n_fft
+```
+
+Calling it the librosa way used to return a plausible array of entirely the
+wrong length with no error; it now raises and tells you the correct call.
 
 ### `librosa_cqt` / `vqt` coverage
 
-`vqt(y, plan)` takes a **1-D** signal, not a batch, and covers the parameter sets
-that need no early downsampling. Others raise `NotImplementedError` — including
-the common `sr=44100, hop_length=512, n_bins=84, bins_per_octave=12`. Use
-`hybrid_cqt` for the general case.
+`vqt(y, plan)` is **mono only** — a 1-D signal, no batch dimension — and covers
+the parameter sets that need no early downsampling. Others raise
+`NotImplementedError` naming `hybrid_cqt` as the alternative, including the
+common `sr=44100, hop_length=512, n_bins=84, bins_per_octave=12`. `hybrid_cqt`
+takes batched input and has no such parameter restriction.
 
 ### `HybridCQTTransform`
 

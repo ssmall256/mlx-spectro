@@ -184,7 +184,13 @@ def build_vqt_plan(sr=None, hop_length=320, fmin=None, n_bins=352, bins_per_octa
     dc1 = max(0, int(np.ceil(np.log2(nyq / filter_cutoff)) - 1) - 1)
     dc2 = max(0, _num_two_factors(hop_length) - n_octaves + 1)
     if min(dc1, dc2) != 0:
-        raise NotImplementedError("early downsampling required for these params; not supported")
+        raise NotImplementedError(
+            f"vqt does not support these parameters: sr={sr}, "
+            f"hop_length={hop_length}, n_bins={n_bins}, "
+            f"bins_per_octave={bins_per_octave} would need librosa's early "
+            "downsampling, which is not implemented here. Use hybrid_cqt for "
+            "this configuration, or lower the sample rate."
+        )
 
     fft_bases, n_ffts, hops, downsamples = [], [], [], []
     my_sr, my_hop = float(sr), hop_length
@@ -241,7 +247,15 @@ def vqt(y: mx.array, plan: VQTPlan, resample_fn: Optional[ResampleFn] = None) ->
 
     y: 1-D mlx waveform at plan.sr. resample_fn(signal, orig_sr, target_sr)->signal for
     the per-octave 2:1 downsample; if None, an FFT fallback is used.
+
+    Mono only -- there is no batch dimension. Loop over channels, or use
+    :func:`~mlx_spectro.hybrid_cqt`, which takes batched input.
     """
+    if y.ndim != 1:
+        raise ValueError(
+            f"vqt expects a 1-D waveform, got shape {tuple(y.shape)}. It is mono "
+            "only: loop over channels, or use hybrid_cqt for batched input."
+        )
     my_y = y
     resp = []
     for i in range(plan.n_octaves):

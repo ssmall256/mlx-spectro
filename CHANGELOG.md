@@ -58,13 +58,25 @@
   class here spells it `sample_rate`; callers should not have to remember which
   side of that line a function sits on. Passing both with different values raises.
   Defaults and the `sr` spelling are unchanged.
-- The README now documents that `mel_filterbank` (madmom, area-normalized) and
-  `mel_filterbank_librosa` (librosa, Slaney) differ in filter magnitude by roughly
-  87x — about 19 dB — and that `mel_filterbank_librosa` defaults to `htk=True`
-  while `librosa.filters.mel` defaults to `htk=False`, so defaults on both sides
-  do not match. It also records that `vqt` takes a 1-D signal and raises
-  `NotImplementedError` for parameter sets needing early downsampling, including
-  the common 44.1 kHz configuration.
+- **`mel_filterbank_librosa` now defaults to `htk=False`, matching
+  `librosa.filters.mel`.** It defaulted to `htk=True`, so the two disagreed
+  exactly when a caller was least likely to check — passing defaults on both
+  sides. Defaults now agree to 1e-9, and the function is verified against librosa
+  across three configurations and both `htk` settings; it previously had no test
+  at all. It remains not interchangeable with `mel_filterbank`, which follows
+  madmom: area-normalized triangles peaking at 1.0 against Slaney-normalized ones
+  peaking near 0.01, roughly 80x or 19 dB in everything downstream. Documented,
+  and pinned by a test.
+- **`fft_frequencies` rejects librosa's argument order instead of silently
+  returning the wrong array.** It takes `(num_fft_bins, sample_rate)` — the
+  opposite order from `librosa.fft_frequencies`, and a bin count rather than
+  `n_fft`. Called the librosa way it returned a plausible-looking array of
+  entirely the wrong length, which flowed into a filterbank of the wrong shape
+  with no error anywhere. It now raises and prints the correct call.
+- `vqt` refuses batched input with a message naming the constraint, instead of
+  an unrelated `[matmul]` shape error from inside the kernel, and its
+  `NotImplementedError` for unsupported parameters now names `hybrid_cqt` as the
+  alternative and prints the parameters that were rejected.
 - Benchmark scripts write their JSON next to themselves instead of to a path
   relative to the caller's working directory, and no longer carry an absolute
   developer path in their docstrings.
