@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.4
+
+### Fixed
+
+- Hybrid-CQT snapshot tests compared float32 aggregates with an absolute-only
+  tolerance. `sum` is ~10^3 here, so `atol=1e-6` demanded agreement three orders
+  of magnitude tighter than float32 can express, and CI failed on relative
+  differences of about three ULPs when a different GPU reassociated the
+  reduction. Now `rtol=1e-5` with an absolute floor, which a real change to the
+  transform still trips by two orders of magnitude.
+- `uv.lock` refreshed; it still described the project as 0.7.0 and required
+  `mlx>=0.30.3`, both superseded. It ships in the sdist.
+
 ## 0.9.3
 
 ### Changed

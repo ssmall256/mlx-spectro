@@ -15,6 +15,18 @@ def _audio(length: int = 24_000, *, seed: int = 0) -> np.ndarray:
     return (0.2 * rng.standard_normal(length)).astype(np.float32)
 
 
+# The snapshots were recorded on one machine, and the transform is float32:
+# a different GPU reassociates the reductions and lands a few ULPs away. An
+# absolute-only tolerance is therefore wrong on the aggregates, whose magnitude
+# is set by the input length -- `sum` here is ~10^3, so atol=1e-6 asked for
+# agreement three orders of magnitude tighter than float32 can express, and CI
+# failed on relative differences of 3e-7 (about 3 ULPs). Relative tolerance with
+# an absolute floor for values near zero. A real change to the transform moves
+# these far more than 1e-5.
+_RTOL = 1e-5
+_ATOL = 1e-6
+
+
 def _assert_snapshot(name: str) -> None:
     snapshot = HYBRID_CQT_SNAPSHOTS[name]
     transform = HybridCQTTransform(**snapshot["kwargs"])
@@ -23,24 +35,23 @@ def _assert_snapshot(name: str) -> None:
     )
     out = _to_numpy(transform(audio))
     assert out.shape == snapshot["shape"]
-    np.testing.assert_allclose(out.sum(dtype=np.float64), snapshot["sum"], atol=1e-6)
-    np.testing.assert_allclose(out.mean(dtype=np.float64), snapshot["mean"], atol=1e-7)
-    np.testing.assert_allclose(out.std(dtype=np.float64), snapshot["std"], atol=1e-7)
-    np.testing.assert_allclose(out.max(), snapshot["max"], atol=1e-6)
-    np.testing.assert_allclose(
-        out[:3, :6], np.asarray(snapshot["first_block"], dtype=np.float32), atol=1e-6
+    check = lambda actual, expected: np.testing.assert_allclose(  # noqa: E731
+        actual, expected, rtol=_RTOL, atol=_ATOL
     )
+    check(out.sum(dtype=np.float64), snapshot["sum"])
+    check(out.mean(dtype=np.float64), snapshot["mean"])
+    check(out.std(dtype=np.float64), snapshot["std"])
+    check(out.max(), snapshot["max"])
+    check(out[:3, :6], np.asarray(snapshot["first_block"], dtype=np.float32))
     middle_row, middle_col = snapshot["middle_offset"]
-    np.testing.assert_allclose(
+    check(
         out[middle_row : middle_row + 3, middle_col : middle_col + 6],
         np.asarray(snapshot["middle_block"], dtype=np.float32),
-        atol=1e-6,
     )
     last_row, last_col = snapshot["last_offset"]
-    np.testing.assert_allclose(
+    check(
         out[last_row : last_row + 3, last_col : last_col + 6],
         np.asarray(snapshot["last_block"], dtype=np.float32),
-        atol=1e-6,
     )
 
 
