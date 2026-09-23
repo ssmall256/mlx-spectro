@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.6
+
+### Removed
+
+- The `.gitignore` entries added in 0.9.5 named specific editor and assistant
+  tooling. They live in a global ignore file instead, so the repository does not
+  carry them.
+
 ## 0.9.5
 
 ### Removed

@@ -11,11 +11,3 @@ build/
 venv/
 .DS_Store
 
-# local tooling notes, never committed
-AGENTS.md
-CLAUDE.md
-.claude/
-.codex/
-.cursor/
-.aider*
-claude-reports/
