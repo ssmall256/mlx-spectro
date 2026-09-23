@@ -15,7 +15,7 @@ def _to_numpy(x: mx.array) -> np.ndarray:
 
 
 def test_melscale_fbanks_matches_torchaudio_reference():
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     ta_f = pytest.importorskip("torchaudio.functional")
 
     ours = _to_numpy(

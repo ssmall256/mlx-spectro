@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import platform
-import sys
 import time
 import warnings
 from statistics import median
@@ -668,7 +667,7 @@ def main() -> None:
 
     chip = platform.processor() or "unknown"
     mac = platform.mac_ver()[0]
-    print(f"## mlx-spectro benchmarks")
+    print("## mlx-spectro benchmarks")
     print(f"Machine: macOS {mac}, {chip}")
     print(f"MLX: {mx.__version__}")
     if _HAS_TORCH:

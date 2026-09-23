@@ -142,9 +142,32 @@ class VQTPlan:
     lengths: np.ndarray      # [n_bins] full-rate filter lengths (final 1/sqrt scaling)
 
 
-def build_vqt_plan(sr=16000, hop_length=320, fmin=None, n_bins=352, bins_per_octave=48,
-                   gamma=0.0, filter_scale=1, norm=1, sparsity=0.01) -> VQTPlan:
-    """Build the librosa-compatible VQT plan. fmin defaults to midi_to_hz(21)=27.5."""
+def _resolve_sample_rate(sr, sample_rate, *, default):
+    """Accept either spelling of the sample-rate keyword.
+
+    The CQT/VQT entry points mirror librosa, which spells it `sr`, while every
+    transform class in this package spells it `sample_rate`. Callers should not
+    have to remember which side of that line a given function sits on.
+    """
+    if sample_rate is not None and sr is not None and int(sample_rate) != int(sr):
+        raise TypeError(
+            f"got conflicting sample rates: sr={sr}, sample_rate={sample_rate}"
+        )
+    if sample_rate is not None:
+        return int(sample_rate)
+    if sr is not None:
+        return int(sr)
+    return default
+
+
+def build_vqt_plan(sr=None, hop_length=320, fmin=None, n_bins=352, bins_per_octave=48,
+                   gamma=0.0, filter_scale=1, norm=1, sparsity=0.01, *,
+                   sample_rate=None) -> VQTPlan:
+    """Build the librosa-compatible VQT plan. fmin defaults to midi_to_hz(21)=27.5.
+
+    `sr` and `sample_rate` are accepted interchangeably.
+    """
+    sr = _resolve_sample_rate(sr, sample_rate, default=16000)
     if fmin is None:
         fmin = 440.0 * 2.0 ** ((21 - 69) / 12.0)  # midi_to_hz(21)
 

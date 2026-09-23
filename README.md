@@ -337,6 +337,30 @@ Functional one-off helper with the same parameters as `FilteredSpectrogramTransf
 
 Build logarithmically spaced triangular filterbanks for custom spectrogram frontends. Use `f_ref=440.0` for the madmom-style `f_ref`-anchored family and `f_ref=None` for the `f_min`-anchored family used by some beat frontends. Returns `[n_freqs, n_bands]`.
 
+### Mel filterbanks: two conventions, not interchangeable
+
+| function | convention | normalization |
+|---|---|---|
+| `mel_filterbank(bin_frequencies, num_bands, *, fmin, fmax, norm_filters=True)` | madmom | area-normalized triangles |
+| `mel_filterbank_librosa(sr, n_fft, n_mels, *, fmin=0.0, fmax=None, htk=True, norm="slaney")` | librosa | Slaney |
+
+Filter magnitudes differ between them by roughly **87x** — about 19 dB — so
+swapping one for the other silently changes every downstream level. Pick the one
+matching the reference implementation you are reproducing.
+
+Two gotchas on `mel_filterbank_librosa`: it takes a sample rate and FFT size
+where `mel_filterbank` takes precomputed bin frequencies, and it defaults to
+`htk=True` while `librosa.filters.mel` defaults to `htk=False`. Passing defaults
+on both sides does **not** give you matching filterbanks — pass `htk=False` for
+librosa's default behaviour.
+
+### `librosa_cqt` / `vqt` coverage
+
+`vqt(y, plan)` takes a **1-D** signal, not a batch, and covers the parameter sets
+that need no early downsampling. Others raise `NotImplementedError` — including
+the common `sr=44100, hop_length=512, n_bins=84, bins_per_octave=12`. Use
+`hybrid_cqt` for the general case.
+
 ### `HybridCQTTransform`
 
 Cached hybrid CQT frontend intended for `librosa.hybrid_cqt`-style pipelines and repeated inference workloads.
@@ -362,7 +386,7 @@ Hybrid CQT basis construction is implemented directly in-package and cached at i
 
 **Dynamic range note**: `HybridCQTTransform` returns raw CQT magnitude with 5–6 orders of magnitude dynamic range. If your model uses InstanceNorm or similar per-frame normalization, quiet passages can be overwhelmed by loud sections in the normalization statistics — consider applying explicit frame-level energy normalization (e.g. median-based gain) before inference. This does not apply to `FilteredSpectrogramTransform` with `output_scale="log10_plus_one"` or `LogMelSpectrogramTransform`: log10(1+x) scaling already compresses dynamic range by ~2 orders of magnitude, making explicit energy equalization redundant for those frontends.
 
-### `hybrid_cqt(x, *, sr=22050, hop_length=512, fmin=32.70319566257483, n_bins=84, bins_per_octave=12, filter_scale=1.0, norm=1.0, sparsity=0.01)`
+### `hybrid_cqt(x, *, sample_rate=22050, hop_length=512, fmin=32.70319566257483, n_bins=84, bins_per_octave=12, filter_scale=1.0, norm=1.0, sparsity=0.01)`
 
 Functional one-off helper with the same parameters as `HybridCQTTransform`.
 

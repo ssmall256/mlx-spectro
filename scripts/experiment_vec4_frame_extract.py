@@ -18,8 +18,8 @@ Design:
   - Report speedup/regression per config
 
 Usage:
-    metalq submit -w -n "vec4-frame-extract" -C /Users/sam/Code/mlx-spectro \
-        --uv-project /Users/sam/Code/mlx-spectro -- \
+    metalq submit -w -n "vec4-frame-extract" -C "$(git rev-parse --show-toplevel)" \
+        --uv-project "$(git rev-parse --show-toplevel)" -- \
         python scripts/experiment_vec4_frame_extract.py
 """
 
@@ -27,6 +27,8 @@ import json
 import math
 import sys
 import time
+
+from pathlib import Path
 
 import mlx.core as mx
 
@@ -516,7 +518,7 @@ def main():
         print("unless a specific subset shows compelling gains.")
 
     # Save results
-    with open("scripts/experiment_vec4_results.json", "w") as f:
+    with open(Path(__file__).parent / "experiment_vec4_results.json", "w") as f:
         json.dump(results, f, indent=2)
     print()
     print("Raw results saved to scripts/experiment_vec4_results.json")

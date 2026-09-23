@@ -5219,7 +5219,6 @@ def _extract_frames_numpy(
     frame_size: int,
 ) -> np.ndarray:
     num_samples = len(waveform)
-    n_frames = len(frame_starts)
     offsets = np.arange(frame_size, dtype=np.int64)
     indices = frame_starts[:, None] + offsets[None, :]
     valid = (indices >= 0) & (indices < num_samples)
@@ -5623,7 +5622,7 @@ def positive_spectral_diff(
         else:
             lag = diff_frames_from_hann(
                 frame_size=int(frame_size),
-                hop_size=int(hop_size),
+                hop_size=hop_size,
                 diff_ratio=diff_ratio,
             )
     lag = int(lag)
@@ -5638,6 +5637,24 @@ def positive_spectral_diff(
     diff[..., lag:] = moved[..., lag:] - moved[..., :-lag]
     diff = mx.maximum(diff, 0.0).astype(mx.float32)
     return mx.moveaxis(diff, -1, axis)
+
+
+def _resolve_sample_rate(sr, sample_rate, *, default):
+    """Accept either spelling of the sample-rate keyword.
+
+    The CQT entry points mirror librosa, which spells it `sr`, while every
+    transform class in this package spells it `sample_rate`. Callers should not
+    have to remember which side of that line a given function sits on.
+    """
+    if sample_rate is not None and sr is not None and int(sample_rate) != int(sr):
+        raise TypeError(
+            f"got conflicting sample rates: sr={sr}, sample_rate={sample_rate}"
+        )
+    if sample_rate is not None:
+        return int(sample_rate)
+    if sr is not None:
+        return int(sr)
+    return default
 
 
 class HybridCQTTransform:
@@ -5669,7 +5686,7 @@ class HybridCQTTransform:
     def __init__(
         self,
         *,
-        sr: int = 22_050,
+        sr: int | None = None,
         hop_length: int = 512,
         fmin: float = 32.70319566257483,
         n_bins: int = 84,
@@ -5677,8 +5694,9 @@ class HybridCQTTransform:
         filter_scale: float = 1.0,
         norm: float = 1.0,
         sparsity: float = 0.01,
+        sample_rate: int | None = None,
     ) -> None:
-        self.sr = int(sr)
+        self.sr = _resolve_sample_rate(sr, sample_rate, default=22_050)
         self.hop_length = int(hop_length)
         self.fmin = float(fmin)
         self.n_bins = int(n_bins)
@@ -5879,7 +5897,7 @@ def _cached_hybrid_cqt_transform(
 def hybrid_cqt(
     x: mx.array,
     *,
-    sr: int = 22_050,
+    sr: int | None = None,
     hop_length: int = 512,
     fmin: float = 32.70319566257483,
     n_bins: int = 84,
@@ -5887,10 +5905,14 @@ def hybrid_cqt(
     filter_scale: float = 1.0,
     norm: float = 1.0,
     sparsity: float = 0.01,
+    sample_rate: int | None = None,
 ) -> mx.array:
-    """Compute a hybrid CQT magnitude spectrogram from audio."""
+    """Compute a hybrid CQT magnitude spectrogram from audio.
+
+    `sr` and `sample_rate` are accepted interchangeably.
+    """
     transform = _cached_hybrid_cqt_transform(
-        int(sr),
+        _resolve_sample_rate(sr, sample_rate, default=22_050),
         int(hop_length),
         float(fmin),
         int(n_bins),
@@ -6265,11 +6287,20 @@ def mel_filterbank_librosa(
         fmax = float(sr) / 2.0
 
     if htk:
-        hz2mel = lambda f: 2595.0 * np.log10(1.0 + np.asarray(f, dtype=np.float64) / 700.0)
-        mel2hz = lambda m: 700.0 * (10.0 ** (np.asarray(m, dtype=np.float64) / 2595.0) - 1.0)
+
+        def hz2mel(f):
+            return 2595.0 * np.log10(1.0 + np.asarray(f, dtype=np.float64) / 700.0)
+
+        def mel2hz(m):
+            return 700.0 * (10.0 ** (np.asarray(m, dtype=np.float64) / 2595.0) - 1.0)
+
     else:
-        hz2mel = lambda f: _hz_to_mel(np.asarray(f, dtype=np.float64), mel_scale="slaney")
-        mel2hz = lambda m: _mel_to_hz(np.asarray(m, dtype=np.float64), mel_scale="slaney")
+
+        def hz2mel(f):
+            return _hz_to_mel(np.asarray(f, dtype=np.float64), mel_scale="slaney")
+
+        def mel2hz(m):
+            return _mel_to_hz(np.asarray(m, dtype=np.float64), mel_scale="slaney")
 
     mel_f = mel2hz(np.linspace(hz2mel(fmin), hz2mel(fmax), n_mels + 2))
     fft_freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)

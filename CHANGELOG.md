@@ -53,6 +53,21 @@
   so a change to one — or a regression — would have shipped green.
 
 - Minimum MLX raised to 0.31.2, matching the rest of the MLX audio stack.
+- `hybrid_cqt`, `HybridCQTTransform` and `build_vqt_plan` accept `sample_rate` as
+  well as `sr`. They mirror librosa, which spells it `sr`, while every transform
+  class here spells it `sample_rate`; callers should not have to remember which
+  side of that line a function sits on. Passing both with different values raises.
+  Defaults and the `sr` spelling are unchanged.
+- The README now documents that `mel_filterbank` (madmom, area-normalized) and
+  `mel_filterbank_librosa` (librosa, Slaney) differ in filter magnitude by roughly
+  87x — about 19 dB — and that `mel_filterbank_librosa` defaults to `htk=True`
+  while `librosa.filters.mel` defaults to `htk=False`, so defaults on both sides
+  do not match. It also records that `vqt` takes a 1-D signal and raises
+  `NotImplementedError` for parameter sets needing early downsampling, including
+  the common 44.1 kHz configuration.
+- Benchmark scripts write their JSON next to themselves instead of to a path
+  relative to the caller's working directory, and no longer carry an absolute
+  developer path in their docstrings.
 - **`istft()` raised for any configuration with `hop_length > n_fft`.** 0.8.0 made
   the Metal unroll factor a computed template constant, `min(FRAME/HOP, 8)`, which
   is 0 when the hop exceeds the frame. Metal rejects `#pragma unroll 0`, so all
@@ -60,6 +75,8 @@
   `Unable to build metal library from source`. Non-overlapping frames are unusual
   but legal and worked in 0.7.0. Clamped to 1; output is bit-identical to 0.7.0 at
   every frame/hop combination tested.
+- `positive_spectral_diff` truncated a float `hop_size` to int before passing it
+  on, so the float-hop support added alongside it never reached that path.
 - The kernel autotuner cached an untested default and returned successfully when
   every candidate threadgroup size failed, so a broken kernel surfaced later from an
   unrelated line. That is what turned the unroll bug above into a mysterious

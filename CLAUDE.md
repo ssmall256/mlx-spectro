@@ -8,7 +8,7 @@ Everything lives in two files under `src/mlx_spectro/`:
 
 | Module | Purpose |
 |--------|---------|
-| `spectral_ops.py` | All transforms, Metal kernels, caches (~7.7k lines) |
+| `spectral_ops.py` | All transforms, Metal kernels, caches (~8.2k lines) |
 | `__init__.py` | Public API exports |
 
 **Core transform classes** (each has eager + compiled paths):
@@ -63,7 +63,7 @@ No C extensions, no special build steps. Pure Python + MLX.
 pytest tests/ -v
 ```
 
-11 test files. Tests use `np.testing.assert_allclose()` for parity with torch/torchaudio/librosa. Optional imports skipped via `pytest.importorskip()`. No conftest.py. `test_mlx_numpy_parity.py` verifies `_mlx` variants match numpy counterparts.
+16 test files. Tests use `np.testing.assert_allclose()` for parity with torch/torchaudio/librosa. Optional imports are skipped via `pytest.importorskip()`, so run with the `parity` extra installed (`pip install -e ".[dev,parity]"`) -- otherwise 22 parity tests skip silently. No conftest.py. `test_mlx_numpy_parity.py` verifies `_mlx` variants match numpy counterparts.
 
 ## Benchmarks
 

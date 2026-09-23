@@ -14,6 +14,8 @@ import math
 import sys
 import time
 
+from pathlib import Path
+
 import mlx.core as mx
 
 from mlx_spectro.spectral_ops import (
@@ -288,10 +290,10 @@ def main():
             print("No clear threshold where tiled consistently wins. Consider removing tiled path.")
 
     # Dump raw JSON for further analysis
-    with open("scripts/bench_tiled_threshold_results.json", "w") as f:
+    with open(Path(__file__).parent / "bench_tiled_threshold_results.json", "w") as f:
         json.dump(results, f, indent=2)
     print()
-    print(f"Raw results saved to scripts/bench_tiled_threshold_results.json")
+    print("Raw results saved to scripts/bench_tiled_threshold_results.json")
 
 
 if __name__ == "__main__":

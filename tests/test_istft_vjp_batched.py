@@ -112,8 +112,10 @@ def test_istft_gradient_matches_finite_differences_batched(B):
     for b in range(sr_np.shape[0]):
         for n in range(sr_np.shape[1]):
             for f in range(sr_np.shape[2]):
-                plus = sr_np.copy();  plus[b, n, f] += eps
-                minus = sr_np.copy(); minus[b, n, f] -= eps
+                plus = sr_np.copy()
+                plus[b, n, f] += eps
+                minus = sr_np.copy()
+                minus[b, n, f] -= eps
                 numerical[b, n, f] = (
                     float(loss(mx.array(plus)).item())
                     - float(loss(mx.array(minus)).item())

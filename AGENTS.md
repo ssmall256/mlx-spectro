@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Spectral frontend for MLX. Fused Metal kernels for STFT/iSTFT, mel/MFCC/CQT frontends, spectral descriptors. Pure Python, no C extensions. All code lives in `src/mlx_spectro/spectral_ops.py` (~6k lines) and `src/mlx_spectro/__init__.py` (exports).
+Spectral frontend for MLX. Fused Metal kernels for STFT/iSTFT, mel/MFCC/CQT frontends, spectral descriptors. Pure Python, no C extensions. All code lives in `src/mlx_spectro/spectral_ops.py` (~8.2k lines) and `src/mlx_spectro/__init__.py` (exports).
 
 ## Hard Rules
 
@@ -18,7 +18,7 @@ Spectral frontend for MLX. Fused Metal kernels for STFT/iSTFT, mel/MFCC/CQT fron
 pytest tests/ -v
 ```
 
-9 test files. Accuracy assertions use `np.testing.assert_allclose(ours, ref, rtol=1e-6, atol=1e-6)` against torch/torchaudio/librosa. If torch is not installed, those tests are skipped via `pytest.importorskip()`. Do not make torch a required test dependency.
+16 test files. Accuracy assertions use `np.testing.assert_allclose(ours, ref, rtol=1e-6, atol=1e-6)` against torch/torchaudio/librosa. Those tests are skipped via `pytest.importorskip()` when the reference library is absent, so **install the `parity` extra** (`pip install -e ".[dev,parity]"`) before trusting a green run -- with only `dev`, 22 parity tests skip and the suite is green whether or not parity holds. CI installs `parity`. Keep torch out of the `dev` extra.
 
 If you change a Metal kernel or transform output, run the full test suite and verify no regressions in accuracy or shape.
 
