@@ -705,13 +705,15 @@ Note that most are read into module-level constants at import, so setting
 
 ## Warnings
 
-The library warns rather than failing silently in two cases. Neither is noise;
-each means output you would otherwise trust is not what you expect.
+The library warns rather than failing silently in three cases. None of them is
+noise; each means output you would otherwise trust is not what you expect, or is
+slower than it needs to be.
 
 | Warning | Means |
 |---|---|
 | `istft: the window overlap-add envelope is degenerate` | Your `n_fft`/`hop_length`/`window` combination violates NOLA, so samples where the envelope falls below `1e-11` are emitted as exact zeros — the reconstruction has silent gaps. Raised as an error under `torch_like=True`, matching Torch. Emitted once per transform configuration. `center=False` triggers it legitimately, because the first and last `n_fft` samples are never fully covered. |
 | `mlx-spectro: Metal kernel ... failed to compile` | Metal is unavailable or the kernel was rejected, so the pure-MLX path is being used instead: slower, and rounds differently. Emitted once per process. |
+| `mlx-spectro: threadgroup autotuning ... was skipped` | The call is inside `mx.compile` or `vmap`, where tuning cannot time candidates, so the kernel runs at its default threadgroup size. Output is unaffected; speed may be. Call the transform once outside the compiled function to tune and cache it — `compiled_pair` and `compiled_pair_nd` already do. Emitted once per `(kernel, n_fft, hop)`. |
 
 ## License
 
