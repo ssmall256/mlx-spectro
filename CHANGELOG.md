@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.3
+
+### Changed
+
+- README documents the `threadgroup autotuning ... was skipped` warning added
+  in 0.9.2, alongside the NOLA and Metal-compile ones.
+
 ## 0.9.2
 
 ### Fixed
