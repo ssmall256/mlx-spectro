@@ -101,7 +101,6 @@ __all__ = [
     "reset_cache_debug_stats",
 ]
 
-import hashlib
 import json
 import math
 import os
@@ -1584,17 +1583,15 @@ WindowLike = Union[str, mx.array, None]
 def _window_cache_signature(
     *,
     provided_window: WindowLike,
-    resolved_window: mx.array,
     window_fn: str,
     win_length: int,
     n_fft: int,
     periodic: bool,
 ) -> tuple:
-    """Return a stable key component identifying window shape/content."""
+    """Share generated-window checks; keep custom-window checks per transform."""
     if isinstance(provided_window, mx.array):
-        arr = np.ascontiguousarray(np.asarray(resolved_window, dtype=np.float32))
-        digest = hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
-        return ("array", int(arr.shape[0]), digest)
+        # A content hash here would evaluate a lazy MLX window.
+        return ("array-instance", object())
     return ("generated", str(window_fn), int(win_length), int(n_fft), bool(periodic))
 
 # ==============================================================================
@@ -2454,7 +2451,6 @@ class SpectralTransform:
         self.window = mx.contiguous(self.window)
         self._window_cache_sig = _window_cache_signature(
             provided_window=window,
-            resolved_window=self.window,
             window_fn=self.window_fn,
             win_length=self.win_length,
             n_fft=self.n_fft,
@@ -4979,6 +4975,37 @@ def positive_spectral_diff_numpy(
     return diff.astype(np.float32)
 
 
+def _spectral_diff_mlx(
+    spec: mx.array,
+    *,
+    diff_frames: int,
+    diff_max_bins: int | None,
+    positive_diffs: bool,
+) -> mx.array:
+    """Keep frequency-local spectral differences in the MLX graph."""
+    previous = spec[:-diff_frames]
+    if diff_max_bins is not None:
+        left = diff_max_bins // 2
+        padded = mx.pad(
+            previous,
+            ((0, 0), (left, diff_max_bins - 1 - left)),
+            mode="reflect",
+        )
+        previous = mx.max(
+            mx.stack(
+                [padded[:, offset : offset + spec.shape[1]] for offset in range(diff_max_bins)],
+                axis=-1,
+            ),
+            axis=-1,
+        )
+    diff = mx.concatenate(
+        (mx.zeros_like(spec[:diff_frames]), spec[diff_frames:] - previous), axis=0
+    )
+    if positive_diffs:
+        diff = mx.maximum(diff, 0.0)
+    return diff.astype(mx.float32)
+
+
 def _bands_per_resolution(
     frame_sizes: tuple[int, ...],
     num_bands: int | tuple[int, ...],
@@ -5096,8 +5123,8 @@ def madmom_multires_log_diff_features_mlx(
                 time_axis=0,
             )
         else:
-            diff_np = positive_spectral_diff_numpy(
-                np.asarray(log_spec, dtype=np.float32),
+            diff = _spectral_diff_mlx(
+                log_spec,
                 diff_frames=diff_frames_from_hann(
                     frame_size=frame_size,
                     hop_size=hop_size,
@@ -5106,7 +5133,6 @@ def madmom_multires_log_diff_features_mlx(
                 diff_max_bins=diff_max_bins,
                 positive_diffs=positive_diffs,
             )
-            diff = mx.array(diff_np, dtype=mx.float32)
         min_len = log_spec.shape[0] if min_len is None else min(min_len, int(log_spec.shape[0]))
         feature_blocks.extend((log_spec, diff))
     if min_len is None:

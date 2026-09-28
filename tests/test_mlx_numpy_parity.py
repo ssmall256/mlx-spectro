@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mlx_spectro import (
     madmom_multires_log_diff_features,
@@ -13,6 +14,7 @@ from mlx_spectro import (
     madmom_single_resolution_log_stack,
     madmom_single_resolution_log_stack_mlx,
 )
+from mlx_spectro.spectral_ops import _spectral_diff_mlx, positive_spectral_diff_numpy
 
 
 def _test_waveform(seconds: float = 1.0, sample_rate: int = 44_100) -> np.ndarray:
@@ -92,6 +94,49 @@ def test_multires_log_diff_features_mlx_per_resolution_bands() -> None:
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    ("diff_max_bins", "positive_diffs"),
+    [(3, True), (3, False), (None, False)],
+)
+def test_multires_log_diff_features_mlx_frequency_max_stays_lazy(
+    monkeypatch, diff_max_bins, positive_diffs
+) -> None:
+    waveform = mx.array(_test_waveform())
+    kwargs = dict(
+        frame_sizes=(1024, 2048),
+        fps=100.0,
+        num_bands=6,
+        diff_max_bins=diff_max_bins,
+        positive_diffs=positive_diffs,
+    )
+    expected = madmom_multires_log_diff_features(np.asarray(waveform), **kwargs)
+    original_asarray = np.asarray
+
+    def reject_mlx_asarray(value, *args, **kwargs):
+        if isinstance(value, mx.array):
+            raise AssertionError("MLX array crossed into NumPy")
+        return original_asarray(value, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "asarray", reject_mlx_asarray)
+        actual = madmom_multires_log_diff_features_mlx(waveform, **kwargs)
+        mx.eval(actual)
+
+    np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(("num_bands", "window_size"), [(1, 3), (2, 5), (6, 3), (6, 7)])
+def test_spectral_diff_mlx_reflection_matches_numpy(num_bands, window_size) -> None:
+    spec = np.arange(8 * num_bands, dtype=np.float32).reshape(8, num_bands)
+    expected = positive_spectral_diff_numpy(
+        spec, diff_frames=2, diff_max_bins=window_size, positive_diffs=False
+    )
+    actual = _spectral_diff_mlx(
+        mx.array(spec), diff_frames=2, diff_max_bins=window_size, positive_diffs=False
+    )
+    np.testing.assert_array_equal(np.asarray(actual), expected)
 
 
 def test_multires_mel_stack_mlx_matches_numpy() -> None:

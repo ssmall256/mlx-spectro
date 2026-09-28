@@ -1,6 +1,6 @@
 # mlx-spectro
 
-High-performance spectral frontends for [Apple MLX](https://github.com/ml-explore/mlx): fast STFT/iSTFT, mel/log-mel/MFCC extraction, reusable filtered spectrograms, descriptor bundles, and hybrid CQT. The core STFT/iSTFT path remains **2–3x faster STFT** and **5–8x faster iSTFT** than `torch.stft`/`torch.istft` on MPS via fused Metal kernels.
+High-performance spectral frontends for [Apple MLX](https://github.com/ml-explore/mlx): fast STFT/iSTFT, mel/log-mel/MFCC extraction, reusable filtered spectrograms, descriptor bundles, and hybrid CQT. In the [MLX 0.30.6 benchmarks](#benchmarks) below, the fused Metal kernels measured **2–3x faster STFT** and **5–8x faster iSTFT** than `torch.stft`/`torch.istft` on MPS.
 
 ```python
 from mlx_spectro import SpectralTransform
@@ -58,7 +58,7 @@ mfcc_transform = MFCCTransform(
 coeffs = mfcc_transform(audio)  # [B, n_mfcc, frames]
 ```
 
-[mlx-audio-separator](https://github.com/ssmall256/mlx-audio-separator) uses mlx-spectro for MLX-native stem separation (Roformer, MDX, Demucs) and runs **1.8–3.1x faster end-to-end** than python-audio-separator on torch+MPS. See [benchmarks](#real-world-mlx-audio-separator) below.
+[mlx-audio-separator](https://github.com/ssmall256/mlx-audio-separator) uses mlx-spectro for MLX-native stem separation (Roformer, MDX, Demucs). The [published comparison](#real-world-mlx-audio-separator) measured **1.8–3.1x faster end-to-end** than python-audio-separator on torch+MPS.
 
 ## Install
 
@@ -558,7 +558,7 @@ Functional API for madmom-style audio feature extraction. Every function that re
 
 **Multi-resolution feature extraction:**
 
-- `madmom_multires_log_diff_features(waveform, *, frame_sizes, fps, num_bands, ...)` / `madmom_multires_log_diff_features_mlx(...)` — Multi-resolution log-spectrogram + positive spectral difference features, concatenated along the frequency axis. This is the standard feature frontend for madmom RNN onset/beat/downbeat models. `num_bands` can be an int (shared) or a tuple (per-resolution). Returns `[frames, total_bands]`.
+- `madmom_multires_log_diff_features(waveform, *, frame_sizes, fps, num_bands, ...)` / `madmom_multires_log_diff_features_mlx(...)` — Multi-resolution log-spectrogram + spectral difference features, concatenated along the frequency axis. This is the standard feature frontend for madmom RNN onset/beat/downbeat models. `num_bands` can be an int (shared) or a tuple (per-resolution). The `_mlx` variant remains lazy with `diff_max_bins` and `positive_diffs=False`. Returns `[frames, total_bands]`.
 - `madmom_multires_mel_stack(waveform, *, frame_sizes, fps, num_bands, ...)` / `madmom_multires_mel_stack_mlx(...)` — Multi-resolution mel spectrograms stacked along a channel axis. Returns `[frames, n_bands, n_resolutions]`.
 - `madmom_single_resolution_log_stack(waveform, *, frame_size, num_bands, ...)` / `madmom_single_resolution_log_stack_mlx(...)` — Single-resolution log or mel spectrogram with optional `backend="stft_compat"` for madmom STFT-level parity (per-frame extraction with fractional hop). Supports `filterbank="log"` or `filterbank="mel"`.
 
@@ -579,7 +579,7 @@ Functional API for madmom-style audio feature extraction. Every function that re
 **Utility functions:**
 
 - `logarithmic_spectrogram(spec, *, mul=1.0, add=1.0, log_fn=np.log10)` — Apply `log_fn(spec * mul + add)`. Numpy in, numpy out.
-- `positive_spectral_diff_numpy(spec, *, diff_frames, diff_max_bins=None, positive_diffs=True)` — Numpy spectral difference with optional max-bin pooling (superflux-style). See also the MLX `positive_spectral_diff` for on-device computation.
+- `positive_spectral_diff_numpy(spec, *, diff_frames, diff_max_bins=None, positive_diffs=True)` — NumPy spectral difference with optional max-bin pooling (superflux-style). The MLX `positive_spectral_diff` handles positive differences without pooling; `madmom_multires_log_diff_features_mlx` also keeps optional max-bin pooling on-device.
 - `trim_to_shortest(blocks, *, axis=0)` — Trim a list of arrays to the shortest length along `axis`.
 - `repeat_pad_frames(frames, pad_before, *, pad_after=None, axis=0)` — Edge-repeat padding along the time axis (madmom-style).
 - `stack_feature_blocks(blocks, *, layout="feature_stack")` — Concatenate blocks along frequency (`"feature_stack"`) or stack along a channel axis (`"channel_stack"`), trimming to shortest first.
@@ -601,7 +601,7 @@ Frozen dataclasses for structured returns: `FilteredSpectrogramResult(spectrogra
 
 ## Benchmarks
 
-Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
+Historical measurements: Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup). The package now requires MLX 0.32.2; these tables have not been refreshed for that version.
 
 ### STFT Forward
 
@@ -641,7 +641,7 @@ Apple M4 Max, macOS 26.3, MLX 0.30.6, PyTorch 2.10.0, 20 iterations (5 warmup).
 | B=4 T=160k nfft=2048 | 2.86e-06 | 5.25e-06 |
 | B=8 T=480k nfft=1024 | 3.81e-06 | 4.77e-06 |
 
-To reproduce:
+To rerun the benchmarks on the current environment:
 - Full suite: `python scripts/benchmark.py`
 - Dispatch overhead profile: `python scripts/benchmark.py --dispatch-profile`
 - Frontend eager vs compiled benchmarks: `python scripts/benchmark_frontends.py`
@@ -680,6 +680,30 @@ for chunk in audio_stream:
 ```
 
 Use the eager `t.stft()` / `t.istft()` methods when input shapes vary.
+
+For independent chunks whose results are consumed later, bounded asynchronous
+evaluation can overlap GPU work with scheduling the next chunk:
+
+```python
+pending = []
+for chunk in audio_stream:
+    output = stft(chunk)
+    mx.async_eval(output)
+    pending.append(output)
+    if len(pending) == 4:
+        ready = pending.pop(0)
+        mx.eval(ready)
+        consume(ready)
+
+for ready in pending:
+    mx.eval(ready)
+    consume(ready)
+```
+
+`mx.async_eval` is experimental. Keep the queue bounded, and use ordinary
+`mx.eval` when each result is needed immediately. A simpler option for
+independent chunks is to build a small batch of outputs and call
+`mx.eval(*outputs)` once per batch.
 
 ## Environment Variables
 

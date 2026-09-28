@@ -14,6 +14,7 @@ Two behaviors here were invisible by default:
 
 from __future__ import annotations
 
+import io
 import warnings
 
 import mlx.core as mx
@@ -87,6 +88,36 @@ def test_well_conditioned_transform_does_not_warn():
         mx.eval(t.istft(z, length=8000, input_layout="bnf"))
     nola = [w for w in caught if "overlap-add envelope" in str(w.message)]
     assert nola == [], "COLA-compliant configuration should not warn"
+
+
+def test_custom_window_construction_preserves_lazy_graph():
+    window = mx.sin(mx.arange(256, dtype=mx.float32))
+    before = io.StringIO()
+    mx.export_to_dot(before, window)
+    assert "Sin" in before.getvalue()
+
+    SpectralTransform(n_fft=256, hop_length=64, window=window)
+
+    after = io.StringIO()
+    mx.export_to_dot(after, window)
+    assert "Sin" in after.getvalue()
+
+
+def test_custom_window_safety_cache_isolated_per_transform():
+    n_fft = 256
+    signal = mx.ones((1, 2048))
+    good = SpectralTransform(n_fft=n_fft, hop_length=64, window=mx.ones((n_fft,)))
+    bad = SpectralTransform(n_fft=n_fft, hop_length=64, window=mx.zeros((n_fft,)))
+    spectrum = good.stft(signal, output_layout="bnf")
+    mx.eval(spectrum)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mx.eval(good.istft(spectrum, length=2048, input_layout="bnf"))
+    assert not any("overlap-add envelope" in str(w.message) for w in caught)
+
+    with pytest.warns(RuntimeWarning, match="overlap-add envelope is degenerate"):
+        mx.eval(bad.istft(spectrum, length=2048, input_layout="bnf"))
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
