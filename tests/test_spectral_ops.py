@@ -684,6 +684,117 @@ class TestEdgeCases:
                     err_msg=f"tiled vs simple mismatch: B={B}, n_fft={n_fft}, hop={hop}",
                 )
 
+    def test_fused_frame_extract_constant_matches_fallback(self):
+        """Fused Metal frame extraction with constant zero-pad produces bit-exact output vs fallback."""
+        from mlx_spectro.spectral_ops import _FrameExtractCache
+        kernel = _FrameExtractCache.get(pad_mode="constant")
+        if kernel is False:
+            self.skipTest("Metal frame extraction kernel unavailable")
+
+        for B in [1, 4]:
+            for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
+                sig_len = n_fft * 10
+                t = SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann", center_pad_mode="constant")
+                x = mx.random.normal((B, sig_len))
+                mx.eval(x)
+                x_c = mx.contiguous(x)
+
+                # Fused path: Metal kernel
+                pad = n_fft // 2
+                padded_len = sig_len + 2 * pad
+                n_frames = (padded_len - n_fft) // hop + 1
+                params = mx.array([sig_len, n_frames], dtype=mx.int32)
+                tmpl = [
+                    ("T", x.dtype), ("NFFT", n_fft), ("HOP", hop),
+                    ("PAD", pad),
+                ]
+                fused = kernel(
+                    inputs=[x_c, t.window, params],
+                    template=tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_fft, n_frames, B),
+                    threadgroup=(min(256, n_fft), 1, 1),
+                )
+                fused_out = fused[0]
+
+                # Fallback path: pad + stride + multiply
+                x_padded = mx.pad(x_c, [(0, 0), (pad, pad)], mode="constant")
+                T_pad = x_padded.shape[1]
+                frames = mx.as_strided(
+                    x_padded, shape=(B, n_frames, n_fft),
+                    strides=(T_pad, hop, 1),
+                )
+                fallback_out = frames * t.window
+
+                mx.eval(fused_out, fallback_out)
+                np.testing.assert_array_equal(
+                    np.array(fused_out), np.array(fallback_out),
+                    err_msg=f"fused constant frame extract mismatch: B={B}, n_fft={n_fft}, hop={hop}",
+                )
+
+    def test_tiled_frame_extract_constant_matches_simple(self):
+        """Tiled frame extraction with constant zero-pad is bit-exact vs simple kernel."""
+        from mlx_spectro.spectral_ops import _FrameExtractCache
+
+        simple = _FrameExtractCache.get_simple(pad_mode="constant")
+        tiled = _FrameExtractCache.get_tiled(pad_mode="constant")
+        if simple is False:
+            self.skipTest("Simple constant frame extraction kernel unavailable")
+        if tiled is False:
+            self.skipTest("Tiled constant frame extraction kernel unavailable")
+
+        for B in [1, 4]:
+            for n_fft, hop in [(512, 128), (1024, 256), (2048, 512)]:
+                tp = _FrameExtractCache.tile_params(n_fft, hop)
+                if tp is None:
+                    continue
+                tile_frames, tg_x, tg_y, chunk_len = tp
+
+                sig_len = n_fft * 10
+                x = mx.random.normal((B, sig_len))
+                mx.eval(x)
+                x_c = mx.contiguous(x)
+
+                pad = n_fft // 2
+                padded_len = sig_len + 2 * pad
+                n_frames = (padded_len - n_fft) // hop + 1
+                params = mx.array([sig_len, n_frames], dtype=mx.int32)
+
+                s_tmpl = [
+                    ("T", x.dtype), ("NFFT", n_fft), ("HOP", hop),
+                    ("PAD", pad),
+                ]
+                win = SpectralTransform(n_fft=n_fft, hop_length=hop, window_fn="hann", center_pad_mode="constant").window
+                simple_out = simple(
+                    inputs=[x_c, win, params],
+                    template=s_tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_fft, n_frames, B),
+                    threadgroup=(min(256, n_fft), 1, 1),
+                )[0]
+
+                n_tile_groups = math.ceil(n_frames / tile_frames)
+                t_tmpl = s_tmpl + [
+                    ("TILE_FRAMES", tile_frames), ("TG_X", tg_x),
+                    ("TG_Y", tg_y), ("CHUNK_LEN", chunk_len),
+                ]
+                tiled_out = tiled(
+                    inputs=[x_c, win, params],
+                    template=t_tmpl,
+                    output_shapes=[(B, n_frames, n_fft)],
+                    output_dtypes=[x.dtype],
+                    grid=(n_tile_groups * tg_x, tg_y, B),
+                    threadgroup=(tg_x, tg_y, 1),
+                )[0]
+
+                mx.eval(simple_out, tiled_out)
+                np.testing.assert_array_equal(
+                    np.array(simple_out), np.array(tiled_out),
+                    err_msg=f"tiled vs simple constant mismatch: B={B}, n_fft={n_fft}, hop={hop}",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Autograd (differentiable STFT / iSTFT)
@@ -750,6 +861,22 @@ class TestSTFTBackward:
         g = mx.grad(loss)(x)
         mx.eval(g)
         assert g.shape == x.shape
+        assert bool(mx.isfinite(g).all().item())
+        assert bool((mx.abs(g).sum() > 0).item())
+
+    def test_stft_backward_constant_pad(self):
+        """Backward works with center_pad_mode='constant'."""
+        t = SpectralTransform(512, 128, center_pad_mode="constant")
+        x = mx.random.normal((2, 4096))
+        mx.eval(x)
+
+        def loss(x):
+            return mx.abs(t.differentiable_stft(x)).square().sum()
+
+        g = mx.grad(loss)(x)
+        mx.eval(g)
+        assert g.shape == x.shape
+        assert g.dtype == mx.float32
         assert bool(mx.isfinite(g).all().item())
         assert bool((mx.abs(g).sum() > 0).item())
 

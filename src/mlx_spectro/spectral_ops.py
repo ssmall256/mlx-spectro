@@ -582,6 +582,22 @@ float val = (float)signal[b_idx * sig_len + orig_idx] * (float)win[f_idx];
 out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)val;
 """
 
+_METAL_FUSED_FRAME_EXTRACT_CONSTANT_TEMPLATE = """
+int sig_len = params[0];
+int n_frames = params[1];
+int f_idx = (int)thread_position_in_grid.x;
+int n_idx = (int)thread_position_in_grid.y;
+int b_idx = (int)thread_position_in_grid.z;
+if (f_idx >= NFFT || n_idx >= n_frames) return;
+
+int src_pos = n_idx * HOP + f_idx;
+float val = 0.0f;
+if (src_pos >= PAD && src_pos < PAD + sig_len) {
+    val = (float)signal[b_idx * sig_len + (src_pos - PAD)] * (float)win[f_idx];
+}
+out[b_idx * n_frames * NFFT + n_idx * NFFT + f_idx] = (T)val;
+"""
+
 _METAL_TILED_FRAME_EXTRACT_TEMPLATE = """
 // Threadgroup shared memory for the signal chunk covering this tile of frames.
 // CHUNK_LEN = (TILE_FRAMES - 1) * HOP + NFFT, sized at compile time.
@@ -620,6 +636,55 @@ for (int i = my_id; i < chunk_len; i += n_threads) {
         orig_idx = sig_len - 2 - (src_pos - PAD - sig_len);
     }
     shared_buf[i] = (float)signal[b_idx * sig_len + orig_idx];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// Each thread handles one frame in the tile, looping over fft bins
+int tile_frame = local_y;
+if (tile_frame < n_tile_frames) {
+    int n_idx = frame_start + tile_frame;
+    for (int f = local_x; f < NFFT; f += TG_X) {
+        int local_pos = tile_frame * HOP + f;
+        float val = shared_buf[local_pos] * (float)win[f];
+        out[b_idx * n_frames * NFFT + n_idx * NFFT + f] = (T)val;
+    }
+}
+"""
+
+_METAL_TILED_FRAME_EXTRACT_CONSTANT_TEMPLATE = """
+// Threadgroup shared memory for the signal chunk covering this tile of frames.
+// CHUNK_LEN = (TILE_FRAMES - 1) * HOP + NFFT, sized at compile time.
+threadgroup float shared_buf[CHUNK_LEN];
+
+int sig_len = params[0];
+int n_frames = params[1];
+
+int local_x = (int)thread_position_in_threadgroup.x;
+int local_y = (int)thread_position_in_threadgroup.y;
+int tg_x_idx = (int)threadgroup_position_in_grid.x;
+int b_idx = (int)threadgroup_position_in_grid.z;
+
+// Frame range for this tile
+int frame_start = tg_x_idx * TILE_FRAMES;
+int frame_end = frame_start + TILE_FRAMES;
+if (frame_end > n_frames) frame_end = n_frames;
+int n_tile_frames = frame_end - frame_start;
+
+// Virtual-padded range this tile needs
+int sig_start = frame_start * HOP;
+int sig_end_val = (frame_end - 1) * HOP + NFFT;
+int chunk_len = sig_end_val - sig_start;
+
+// Cooperative load: all threads load signal into shared memory
+int n_threads = TG_X * TG_Y;
+int my_id = local_y * TG_X + local_x;
+for (int i = my_id; i < chunk_len; i += n_threads) {
+    int src_pos = sig_start + i;
+    if (src_pos >= PAD && src_pos < PAD + sig_len) {
+        shared_buf[i] = (float)signal[b_idx * sig_len + (src_pos - PAD)];
+    } else {
+        shared_buf[i] = 0.0f;
+    }
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -703,6 +768,34 @@ if (t_idx >= sig_len - PAD - 1 && t_idx < sig_len - 1) {
             int f = padded_pos - k * HOP;
             acc += (float)grad_frames[base_offset + k * NFFT + f] * (float)win[f];
         }
+    }
+}
+
+out[b_idx * sig_len + t_idx] = (T)acc;
+"""
+
+_METAL_STFT_BACKWARD_CONSTANT_TEMPLATE = """
+int sig_len = params[0];
+int n_frames = params[1];
+int t_idx = (int)thread_position_in_grid.x;
+int b_idx = (int)thread_position_in_grid.y;
+if (t_idx >= sig_len) return;
+
+int base_offset = b_idx * n_frames * NFFT;
+float acc = 0.0f;
+
+// Interior contribution: padded position = t_idx + PAD
+{
+    int padded_pos = t_idx + PAD;
+    int k_max = padded_pos / HOP;
+    if (k_max >= n_frames) k_max = n_frames - 1;
+    int k_min = 0;
+    { int target = padded_pos - NFFT; if (target >= 0) k_min = (target / HOP) + 1; }
+
+    #pragma unroll 4
+    for (int k = k_min; k <= k_max; ++k) {
+        int f = padded_pos - k * HOP;
+        acc += (float)grad_frames[base_offset + k * NFFT + f] * (float)win[f];
     }
 }
 
@@ -861,10 +954,30 @@ class _FrameExtractCache:
     """Singleton for the fused frame-extraction Metal kernels (simple + tiled)."""
     _lock = threading.Lock()
     _simple: object = None
+    _simple_constant: object = None
     _tiled: object = None
+    _tiled_constant: object = None
 
     @classmethod
-    def get_simple(cls):
+    def get_simple(cls, pad_mode: str = "reflect"):
+        if pad_mode == "constant":
+            if cls._simple_constant is not None:
+                return cls._simple_constant
+            with cls._lock:
+                if cls._simple_constant is not None:
+                    return cls._simple_constant
+                try:
+                    cls._simple_constant = mx.fast.metal_kernel(
+                        name="fused_frame_extract_constant",
+                        input_names=["signal", "win", "params"],
+                        output_names=["out"],
+                        source=_METAL_FUSED_FRAME_EXTRACT_CONSTANT_TEMPLATE,
+                    )
+                except Exception as exc:
+                    cls._simple_constant = False
+                    _warn_metal_unavailable('fused_frame_extract_constant', exc)
+                return cls._simple_constant
+
         if cls._simple is not None:
             return cls._simple
         with cls._lock:
@@ -883,7 +996,25 @@ class _FrameExtractCache:
             return cls._simple
 
     @classmethod
-    def get_tiled(cls):
+    def get_tiled(cls, pad_mode: str = "reflect"):
+        if pad_mode == "constant":
+            if cls._tiled_constant is not None:
+                return cls._tiled_constant
+            with cls._lock:
+                if cls._tiled_constant is not None:
+                    return cls._tiled_constant
+                try:
+                    cls._tiled_constant = mx.fast.metal_kernel(
+                        name="tiled_frame_extract_constant",
+                        input_names=["signal", "win", "params"],
+                        output_names=["out"],
+                        source=_METAL_TILED_FRAME_EXTRACT_CONSTANT_TEMPLATE,
+                    )
+                except Exception as exc:
+                    cls._tiled_constant = False
+                    _warn_metal_unavailable('tiled_frame_extract_constant', exc)
+                return cls._tiled_constant
+
         if cls._tiled is not None:
             return cls._tiled
         with cls._lock:
@@ -902,9 +1033,9 @@ class _FrameExtractCache:
             return cls._tiled
 
     @classmethod
-    def get(cls):
+    def get(cls, pad_mode: str = "reflect"):
         """Backward-compat: return the simple kernel."""
-        return cls.get_simple()
+        return cls.get_simple(pad_mode=pad_mode)
 
     @classmethod
     def tile_params(cls, n_fft: int, hop_length: int) -> Optional[tuple]:
@@ -933,10 +1064,29 @@ class _BackwardKernelCache:
     """Singleton cache for backward-pass Metal kernels."""
     _lock = threading.Lock()
     _stft_bwd: object = None
+    _stft_bwd_constant: object = None
     _istft_bwd: object = None
 
     @classmethod
-    def get_stft_backward(cls):
+    def get_stft_backward(cls, pad_mode: str = "reflect"):
+        if pad_mode == "constant":
+            if cls._stft_bwd_constant is not None:
+                return cls._stft_bwd_constant
+            with cls._lock:
+                if cls._stft_bwd_constant is not None:
+                    return cls._stft_bwd_constant
+                try:
+                    cls._stft_bwd_constant = mx.fast.metal_kernel(
+                        name="stft_backward_constant",
+                        input_names=["grad_frames", "win", "params"],
+                        output_names=["out"],
+                        source=_METAL_STFT_BACKWARD_CONSTANT_TEMPLATE,
+                    )
+                except Exception as exc:
+                    cls._stft_bwd_constant = False
+                    _warn_metal_unavailable('stft_backward_constant', exc)
+                return cls._stft_bwd_constant
+
         if cls._stft_bwd is not None:
             return cls._stft_bwd
         with cls._lock:
@@ -2829,12 +2979,12 @@ class SpectralTransform:
         B, sig_len = x.shape
 
         # Try Metal backward kernel
-        use_reflect_fast_path = (
-            center and center_pad_mode == "reflect" and center_tail_pad == "symmetric"
+        use_fused_fast_path = (
+            center and center_pad_mode in ("reflect", "constant") and center_tail_pad == "symmetric"
         )
-        bwd_kernel = _BackwardKernelCache.get_stft_backward() if use_reflect_fast_path else False
+        bwd_kernel = _BackwardKernelCache.get_stft_backward(pad_mode=center_pad_mode) if use_fused_fast_path else False
 
-        if use_reflect_fast_path and bwd_kernel and bwd_kernel is not False and sig_len >= n_fft:
+        if use_fused_fast_path and bwd_kernel and bwd_kernel is not False and sig_len >= n_fft:
             # --- Metal path: fused frame extraction + Metal backward ---
             pad = n_fft // 2
             padded_len = sig_len + 2 * pad
@@ -2842,7 +2992,7 @@ class SpectralTransform:
 
             @mx.custom_function
             def _extract_frames_metal(x_inner: mx.array) -> mx.array:
-                """Forward: Metal fused frame extraction (reflect-pad + window)."""
+                """Forward: Metal fused frame extraction (pad + window)."""
                 B_i = x_inner.shape[0]
                 sl_i = int(x_inner.shape[1])
                 nf = (sl_i + 2 * pad - n_fft) // hop_length + 1
@@ -2852,7 +3002,7 @@ class SpectralTransform:
                     ("T", x_c.dtype), ("NFFT", n_fft),
                     ("HOP", hop_length), ("PAD", pad),
                 ]
-                kernel = _FrameExtractCache.get_simple()
+                kernel = _FrameExtractCache.get_simple(pad_mode=center_pad_mode)
                 outputs = kernel(
                     inputs=[x_c, window, fe_params],
                     template=tmpl,
@@ -2876,9 +3026,14 @@ class SpectralTransform:
                     ("HOP", hop_length), ("PAD", pad),
                 ]
                 grid_bwd = (sl_i, B_i, 1)
+                bwd_kname = (
+                    f"stft_backward_{cotangent_c.dtype}"
+                    if center_pad_mode == "reflect"
+                    else f"stft_backward_constant_{cotangent_c.dtype}"
+                )
                 tgx = _KernelCache.autotune_threadgroup_x(
                     kernel=bwd_kernel,
-                    kernel_name=f"stft_backward_{cotangent_c.dtype}",
+                    kernel_name=bwd_kname,
                     n_fft=n_fft, hop=hop_length,
                     grid=grid_bwd,
                     inputs=[cotangent_c, window, bwd_params],
@@ -3239,12 +3394,12 @@ class SpectralTransform:
         #            ~1.3× faster when bandwidth-bound (large B × sig_len).
         #   Simple — one thread per output element, no shared memory.
         #            Used for small workloads where dispatch latency dominates.
-        use_reflect_fast_path = (
+        use_fused_fast_path = (
             self.center
-            and self.center_pad_mode == "reflect"
+            and self.center_pad_mode in ("reflect", "constant")
             and self.center_tail_pad == "symmetric"
         )
-        if use_reflect_fast_path and sig_len >= self.n_fft:
+        if use_fused_fast_path and sig_len >= self.n_fft:
             pad = self.n_fft // 2
             padded_len = sig_len + 2 * pad
             n_frames = (padded_len - self.n_fft) // self.hop_length + 1
@@ -3257,7 +3412,7 @@ class SpectralTransform:
             # Try tiled kernel for large workloads
             tiled_ok = False
             if out_bytes >= _TILED_FRAME_EXTRACT_BYTE_THRESHOLD:
-                tiled_kernel = _FrameExtractCache.get_tiled()
+                tiled_kernel = _FrameExtractCache.get_tiled(pad_mode=self.center_pad_mode)
                 tp = _FrameExtractCache.tile_params(self.n_fft, self.hop_length)
                 if tiled_kernel and tp is not None:
                     tile_frames, tg_x, tg_y, chunk_len = tp
@@ -3281,7 +3436,7 @@ class SpectralTransform:
 
             # Fall back to simple kernel
             if not tiled_ok:
-                kernel = _FrameExtractCache.get_simple()
+                kernel = _FrameExtractCache.get_simple(pad_mode=self.center_pad_mode)
                 if kernel and kernel is not False:
                     x = mx.contiguous(x)
                     tmpl = [
@@ -3289,9 +3444,14 @@ class SpectralTransform:
                         ("HOP", self.hop_length), ("PAD", pad),
                     ]
                     fe_grid = (self.n_fft, n_frames, B)
+                    fe_kname = (
+                        f"fused_frame_extract_{x.dtype}"
+                        if self.center_pad_mode == "reflect"
+                        else f"fused_frame_extract_constant_{x.dtype}"
+                    )
                     fe_tgx = _KernelCache.autotune_threadgroup_x(
                         kernel=kernel,
-                        kernel_name=f"fused_frame_extract_{x.dtype}",
+                        kernel_name=fe_kname,
                         n_fft=self.n_fft,
                         hop=self.hop_length,
                         grid=fe_grid,

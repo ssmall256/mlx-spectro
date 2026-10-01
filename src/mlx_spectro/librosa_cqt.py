@@ -22,6 +22,8 @@ from typing import Callable, Optional
 import mlx.core as mx
 import numpy as np
 
+from .spectral_ops import get_transform_mlx
+
 ResampleFn = Callable[[mx.array, int, int], mx.array]
 
 # Equivalent noise bandwidth of a periodic Hann window (matches librosa.filters.window_bandwidth('hann')).
@@ -233,13 +235,20 @@ def _stft_ones(y: mx.array, n_fft: int, hop: int) -> mx.array:
 
     Returns [n_fft//2+1, n_frames] complex.
     """
-    pad = n_fft // 2
-    yp = mx.pad(y, [(pad, pad)])
-    n_frames = 1 + (yp.shape[-1] - n_fft) // hop
-    idx = mx.arange(n_fft)[None, :] + hop * mx.arange(n_frames)[:, None]
-    frames = yp[idx]                          # [n_frames, n_fft]
-    spec = mx.fft.rfft(frames, n=n_fft, axis=-1)  # [n_frames, n_fft//2+1]
-    return spec.T                              # [n_fft//2+1, n_frames]
+    st = get_transform_mlx(
+        n_fft=n_fft,
+        hop_length=hop,
+        win_length=n_fft,
+        window_fn="ones",
+        periodic=False,
+        center=True,
+        normalized=False,
+        onesided=True,
+        center_pad_mode="constant",
+        center_tail_pad="symmetric",
+        window=None,
+    )
+    return st.stft(y, output_layout="bfn")[0]
 
 
 def vqt(y: mx.array, plan: VQTPlan, resample_fn: Optional[ResampleFn] = None) -> mx.array:
