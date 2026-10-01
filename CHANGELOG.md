@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.8
+
+### Added
+
+- `waveform_overlap_add` (and alias `waveform_chunk_overlap_add`): Fused Metal kernel
+  and CPU fallback for parallel chunk-based waveform reconstruction across arbitrary
+  channel and stem dimensions. Inverts scatter-add to pull directly from overlapping
+  chunks, eliminating atomic memory contention and intermediate buffer allocations for
+  sliding-window separation models (Demucs, Conv-TasNet, BSRNN).
+- Support for `'constant'` (zero) padding in the fused Metal frame-extraction kernel,
+  matching torch/librosa `pad_mode='constant'` semantics without intermediate pad buffers.
+
+### Changed
+
+- Eliminated host-device MLX synchronization barriers in window synthesis (`make_window`)
+  and feature extraction pipelines, enabling deferred graph evaluation.
+- Optimized `librosa_cqt` (VQT / hybrid CQT) by reusing preallocated filter plans and
+  avoiding redundant intermediate arrays.
+
 ## 0.9.7
 
 ### Changed

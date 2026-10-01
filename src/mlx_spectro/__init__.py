@@ -1,6 +1,6 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.9.0"
+__version__ = "0.9.8"
 
 from .librosa_cqt import VQTPlan, build_vqt_plan, vqt
 from .spectral_ops import (
@@ -103,6 +103,8 @@ from .spectral_ops import (
     triangular_filterbank,
     weighted_phase_deviation,
     zero_crossing_rate,
+    waveform_overlap_add,
+    waveform_chunk_overlap_add,
 )
 
 __all__ = [
@@ -208,4 +210,7 @@ __all__ = [
     "spec_mlx_device_key",
     "get_cache_debug_stats",
     "reset_cache_debug_stats",
+    "waveform_overlap_add",
+    "waveform_chunk_overlap_add",
 ]
+

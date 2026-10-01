@@ -75,6 +75,7 @@ pip install mlx-spectro[torch]
 ## Features
 
 - Fused overlap-add with autotuned Metal kernels for fast STFT/iSTFT
+- Parallel chunk overlap-add (`waveform_overlap_add`) with fused Metal kernels for sliding-window model reconstruction (Demucs, Conv-TasNet, BSRNN)
 - Cached reusable frontends for mel, log-mel, MFCC, filtered spectrograms, and hybrid CQT
 - Shared-STFT descriptor extraction and cached descriptor bundles for repeated-call workloads
 - Madmom-compatible feature extraction: multi-resolution log-diff and mel-stack features, onset detection functions (superflux, complex flux, phase ODFs, etc.), and filterbank builders
@@ -520,6 +521,20 @@ Create or validate a 1D analysis window.
 ### `resolve_fft_params(n_fft, hop_length, win_length, pad)`
 
 Resolve effective FFT parameters with PyTorch-compatible defaults.
+
+### `waveform_overlap_add(frames, step, total_samples=None, window=None, *, normalized=True, require_metal=False)`
+
+Parallel chunk-based waveform reconstruction across time-domain chunks/segments (aliased as `waveform_chunk_overlap_add`).
+
+```python
+from mlx_spectro import waveform_overlap_add
+
+# frames: [num_chunks, channels, chunk_len]
+waveform = waveform_overlap_add(frames, step=hop_samples, window=taper_window)
+# waveform: [channels, total_samples]
+```
+
+Uses an inverted-gather Metal kernel to eliminate atomic scatter-add serialization and intermediate allocations, executing parallel threads across all output samples and channels. Supports 1-D, 2-D, and arbitrary batch/stem prefix shapes `(num_chunks, ..., chunk_len)` with automatic CPU fallback.
 
 ### `melscale_fbanks(n_freqs, f_min, f_max, n_mels, sample_rate, *, norm=None, mel_scale="htk")`
 

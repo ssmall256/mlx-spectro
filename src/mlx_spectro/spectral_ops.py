@@ -543,6 +543,48 @@ for (int k = k_min; k <= k_max; ++k) {
 out[st] = (T)den;
 """
 
+
+
+# --- 3b) Metal Kernel: Waveform Chunk Overlap-Add ---
+# Parallel gather across long waveform chunks (sliding-window model reconstruction).
+# Inverts scatter-add to eliminate atomic contention and intermediate buffer churn.
+_METAL_WAVEFORM_CHUNK_OLA_SOURCE = """
+uint t = thread_position_in_grid.x;
+uint ch = thread_position_in_grid.y;
+
+uint total_samples = uint(params[0]);
+uint chunk_len = uint(params[1]);
+uint step = uint(params[2]);
+uint num_chunks = uint(params[3]);
+uint num_channels = uint(params[4]);
+
+if (t >= total_samples || ch >= num_channels) return;
+
+int last_k = min(int(num_chunks - 1), int(t / step));
+int first_k = max(0, int(int(t) - int(chunk_len) + int(step)) / int(step));
+
+float acc = 0.0f;
+float wsum = 0.0f;
+
+for (int k = first_k; k <= last_k; ++k) {
+    int offset = k * int(step);
+    int j = int(t) - offset;
+    if (j >= 0 && j < int(chunk_len)) {
+        float w = (float)window[j];
+        uint frame_idx = uint(k) * num_channels * chunk_len + ch * chunk_len + uint(j);
+        acc += (float)frames[frame_idx] * w;
+        wsum += w;
+    }
+}
+
+if (NORMALIZE) {
+    out[ch * total_samples + t] = (wsum > 1e-11f) ? (T)(acc / wsum) : (T)0.0f;
+} else {
+    out[ch * total_samples + t] = (T)acc;
+}
+"""
+
+
 # --- 4) Metal Kernel: Fused windowed frame extraction ---
 # Combines reflect-pad + as_strided + window multiply into a single pass.
 # Reads directly from the unpadded signal with reflect-boundary indexing,
@@ -1151,6 +1193,7 @@ class _KernelCache:
     _ola_kernel = None
     _ola_norm_kernel = None
     _envelope_kernel = None
+    _waveform_ola_kernel = None
 
     # Cache of autotuned threadgroup sizes:
     # key: (device_key, kernel_name, n_fft, hop) -> int threadgroup_x
@@ -1516,6 +1559,31 @@ class _KernelCache:
             return cls._envelope_kernel
 
     @classmethod
+    def get_waveform_ola(cls):
+        """Return the waveform chunk OLA Metal kernel (compile once, dtype-agnostic)."""
+        if cls._waveform_ola_kernel is not None:
+            _record_cache_event("kernel_cache.waveform_ola.hit")
+            return cls._waveform_ola_kernel
+        _record_cache_event("kernel_cache.waveform_ola.miss")
+        with cls._lock:
+            if cls._waveform_ola_kernel is not None:
+                return cls._waveform_ola_kernel
+            try:
+                cls._waveform_ola_kernel = mx.fast.metal_kernel(
+                    name="waveform_chunk_overlap_add",
+                    input_names=["frames", "window", "params"],
+                    output_names=["out"],
+                    source=_METAL_WAVEFORM_CHUNK_OLA_SOURCE,
+                )
+                _record_cache_event("kernel_cache.waveform_ola.compile_ok")
+            except Exception as exc:
+                cls._waveform_ola_kernel = False
+                _warn_metal_unavailable("waveform_chunk_overlap_add", exc)
+                _record_cache_event("kernel_cache.waveform_ola.compile_fail")
+            return cls._waveform_ola_kernel
+
+
+    @classmethod
     def debug_snapshot(cls) -> dict:
         def _is_compiled(v):
             return v is not None and v is not False
@@ -1724,7 +1792,121 @@ def _run_metal_ola_norm(
     )
     _record_cache_event("backend.ola_norm.metal")
     return outputs[0]
+
+
+def waveform_overlap_add(
+    frames: mx.array,
+    step: int,
+    total_samples: Optional[int] = None,
+    window: Optional[mx.array] = None,
+    *,
+    normalized: bool = True,
+    require_metal: bool = False,
+) -> mx.array:
+    """Parallel overlap-add reconstruction across time-domain chunks/segments.
+
+    Solves the multi-frame / chunk-based audio separation reconstruction bottleneck
+    for models processing long audio via sliding time-domain chunks (e.g. Demucs,
+    Conv-TasNet, BSRNN, OpenUnmix).
+
+    Args:
+        frames: Array of shape (num_chunks, ..., chunk_len) containing audio chunks.
+        step: Hop size / stride between consecutive chunk offsets in samples (> 0).
+        total_samples: Target output length in samples along the time axis. If None,
+            inferred as `(num_chunks - 1) * step + chunk_len`.
+        window: Optional weighting/tapering window of shape (chunk_len,). If None,
+            a rectangular window of ones is used.
+        normalized: Whether to divide by the accumulated window envelope. Default True.
+        require_metal: If True, raise RuntimeError when the Metal kernel is unavailable.
+
+    Returns:
+        Array of shape (..., total_samples) containing the reconstructed waveform.
+    """
+    if step <= 0:
+        raise ValueError(f"step must be positive, got {step}")
+
+    orig_shape = frames.shape
+    if len(orig_shape) < 2:
+        raise ValueError(
+            f"frames must have at least 2 dimensions (chunks, ..., time), got {orig_shape}"
+        )
+
+    num_chunks = orig_shape[0]
+    prefix_shape = orig_shape[1:-1]
+    chunk_len = orig_shape[-1]
+
+    if total_samples is None:
+        total_samples = max(0, (num_chunks - 1) * step + chunk_len) if num_chunks > 0 else 0
+    total_samples = int(total_samples)
+
+    if num_chunks == 0 or total_samples == 0:
+        return mx.zeros((*prefix_shape, total_samples), dtype=frames.dtype)
+
+    if window is None:
+        window = mx.ones((chunk_len,), dtype=frames.dtype)
+    elif window.shape != (chunk_len,):
+        raise ValueError(f"window shape must be ({chunk_len},), got {window.shape}")
+    elif window.dtype != frames.dtype:
+        window = window.astype(frames.dtype)
+
+    def _fallback(f_in: mx.array, w_in: mx.array) -> mx.array:
+        num_ch = 1
+        for s in prefix_shape:
+            num_ch *= s
+        f_flat = f_in.reshape(num_chunks, num_ch, chunk_len).astype(mx.float32)
+        w_f32 = w_in.astype(mx.float32)
+        out_acc = mx.zeros((num_ch, total_samples), dtype=mx.float32)
+        if normalized:
+            w_acc = mx.zeros((total_samples,), dtype=mx.float32)
+        for k in range(num_chunks):
+            off = k * step
+            this_len = min(chunk_len, total_samples - off)
+            if this_len <= 0:
+                continue
+            end = off + this_len
+            w_sub = w_f32[:this_len]
+            out_acc = out_acc.at[:, off:end].add(f_flat[k, :, :this_len] * w_sub.reshape(1, -1))
+            if normalized:
+                w_acc = w_acc.at[off:end].add(w_sub)
+        if normalized:
+            out_acc = out_acc / mx.maximum(w_acc.reshape(1, -1), 1e-11)
+        return out_acc.reshape(*prefix_shape, total_samples).astype(frames.dtype)
+
+    kernel = _KernelCache.get_waveform_ola()
+    if kernel is False:
+        _record_cache_event("backend.waveform_ola.fallback", detail="metal_unavailable")
+        if require_metal:
+            raise RuntimeError(
+                "require_metal=True but waveform_chunk_overlap_add Metal kernel is unavailable"
+            )
+        return _fallback(frames, window)
+
+    num_channels = 1
+    for s in prefix_shape:
+        num_channels *= s
+
+    frames_flat = mx.contiguous(frames.reshape(num_chunks, num_channels, chunk_len))
+    window_contig = mx.contiguous(window)
+    params = mx.array([total_samples, chunk_len, step, num_chunks, num_channels], dtype=mx.int32)
+    tmpl = [("T", frames.dtype), ("NORMALIZE", 1 if normalized else 0)]
+
+    tg_x = min(256, total_samples)
+    outputs = kernel(
+        inputs=[frames_flat, window_contig, params],
+        template=tmpl,
+        grid=(total_samples, num_channels, 1),
+        threadgroup=(tg_x, 1, 1),
+        output_shapes=[(num_channels * total_samples,)],
+        output_dtypes=[frames.dtype],
+    )
+    _record_cache_event("backend.waveform_ola.metal")
+    return outputs[0].reshape(*prefix_shape, total_samples)
+
+
+waveform_chunk_overlap_add = waveform_overlap_add
+
 # ==============================================================================
+
 # Helpers & Transforms
 # ==============================================================================
 
