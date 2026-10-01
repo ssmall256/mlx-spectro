@@ -1865,7 +1865,13 @@ def waveform_overlap_add(
                 continue
             end = off + this_len
             w_sub = w_f32[:this_len]
-            out_acc = out_acc.at[:, off:end].add(f_flat[k, :, :this_len] * w_sub.reshape(1, -1))
+            chunk_val = f_flat[k, :, :this_len] * w_sub.reshape(1, -1)
+            out_acc = mx.slice_update(
+                out_acc,
+                out_acc[:, off:end] + chunk_val,
+                mx.array([off]),
+                axes=(1,),
+            )
             if normalized:
                 w_acc = w_acc.at[off:end].add(w_sub)
         if normalized:
@@ -2714,9 +2720,9 @@ class SpectralTransform:
     Uses fused kernels and cached configurations for maximum throughput.
     """
     __slots__ = (
-        'n_fft', 'hop_length', 'win_length', 'window', 'window_fn',
+        'n_fft', 'hop_length', 'win_length', '_window', 'window_fn',
         'onesided',
-        '_window_sq', 'center', 'center_pad_mode', 'center_tail_pad',
+        '_window_sq_arr', 'center', 'center_pad_mode', 'center_tail_pad',
         'normalized', 'periodic',
         'istft_backend_policy',
         '_window_cache_sig',
@@ -2773,33 +2779,11 @@ class SpectralTransform:
             default_policy=_DEFAULT_ISTFT_BACKEND_POLICY,
         )
 
-        self.window = make_window(
-            window=window,
-            window_fn=self.window_fn,
-            win_length=self.win_length,
-            n_fft=self.n_fft,
-            periodic=self.periodic,
-        )
-        self.window = mx.contiguous(self.window)
-        self._window_cache_sig = _window_cache_signature(
-            provided_window=window,
-            window_fn=self.window_fn,
-            win_length=self.win_length,
-            n_fft=self.n_fft,
-            periodic=self.periodic,
-        )
-
         # Pre-computed normalization factors (avoid per-call sqrt)
         self._inv_norm_factor = 1.0 / math.sqrt(self.n_fft) if self.normalized else 1.0
         self._norm_factor = math.sqrt(self.n_fft) if self.normalized else 1.0
 
-        # Pre-computed squared window for fused NOLA
-        self._window_sq = mx.contiguous((self.window ** 2).astype(mx.float32))
-        self._window_runtime_cache: Dict[str, Tuple[mx.array, mx.array]] = {
-            str(self.window.dtype): (self.window, self._window_sq)
-        }
-
-        # Legacy caches
+        # Legacy and compilation caches
         self.ola_denom = None
         self.ola_denom_inv = None
         self._cache_key = None
@@ -2808,16 +2792,115 @@ class SpectralTransform:
         self._compiled_pair_nd_fns = {}
         self._torch_window_cache: Dict[str, Any] = {}
 
+        self.set_window(window)
+
+    @property
+    def window(self) -> mx.array:
+        """The 1D analysis/synthesis window array."""
+        return self._window
+
+    @window.setter
+    def window(self, value: WindowLike) -> None:
+        """Replace the window and invalidate all derived runtime caches."""
+        self.set_window(value)
+
+    @property
+    def _window_sq(self) -> mx.array:
+        """The squared window array (float32)."""
+        return self._window_sq_arr
+
+    @_window_sq.setter
+    def _window_sq(self, value: mx.array) -> None:
+        """Assign squared window and sync runtime cache (legacy compatibility)."""
+        self._window_sq_arr = mx.contiguous(value.astype(mx.float32))
+        if hasattr(self, "_window_runtime_cache") and hasattr(self, "_window"):
+            self._window_runtime_cache = {
+                str(self._window.dtype): (self._window, self._window_sq_arr)
+            }
+            if hasattr(self, "_compiled_stft_fns") and self._compiled_stft_fns is not None:
+                self._compiled_stft_fns.clear()
+            if hasattr(self, "_compiled_istft_fns") and self._compiled_istft_fns is not None:
+                self._compiled_istft_fns.clear()
+            if hasattr(self, "_compiled_pair_nd_fns") and self._compiled_pair_nd_fns is not None:
+                self._compiled_pair_nd_fns.clear()
+            self.ola_denom = None
+            self.ola_denom_inv = None
+
+    def set_window(self, window: WindowLike) -> None:
+        """Replace the analysis/synthesis window and invalidate all derived caches.
+
+        Updates ``self.window``, ``self._window_sq``, and ``self._window_cache_sig``,
+        resets ``self._window_runtime_cache`` for all dtypes, and purges compiled
+        function caches and legacy overlap-add denominator buffers.
+
+        Note:
+            If this transform was retrieved from :func:`get_transform_mlx` without an
+            explicit ``window``, mutating it via ``set_window()`` alters an instance
+            that may be shared by other callers. To obtain an unshared transform with
+            a custom window, prefer :meth:`with_window` or
+            ``get_transform_mlx(window=custom_window)``.
+        """
+        new_window = make_window(
+            window=window,
+            window_fn=self.window_fn,
+            win_length=self.win_length,
+            n_fft=self.n_fft,
+            periodic=self.periodic,
+        )
+        self._window = mx.contiguous(new_window)
+        self._window_sq_arr = mx.contiguous((self._window ** 2).astype(mx.float32))
+        self._window_cache_sig = _window_cache_signature(
+            provided_window=window,
+            window_fn=self.window_fn,
+            win_length=self.win_length,
+            n_fft=self.n_fft,
+            periodic=self.periodic,
+        )
+        self._window_runtime_cache = {
+            str(self._window.dtype): (self._window, self._window_sq_arr)
+        }
+        self.ola_denom = None
+        self.ola_denom_inv = None
+        self._cache_key = None
+        if hasattr(self, "_torch_window_cache") and self._torch_window_cache is not None:
+            self._torch_window_cache.clear()
+        if hasattr(self, "_compiled_stft_fns") and self._compiled_stft_fns is not None:
+            self._compiled_stft_fns.clear()
+        if hasattr(self, "_compiled_istft_fns") and self._compiled_istft_fns is not None:
+            self._compiled_istft_fns.clear()
+        if hasattr(self, "_compiled_pair_nd_fns") and self._compiled_pair_nd_fns is not None:
+            self._compiled_pair_nd_fns.clear()
+
+    def with_window(self, window: WindowLike) -> "SpectralTransform":
+        """Return a new, unshared SpectralTransform with the same configuration and a new window.
+
+        This guarantees that no shared transform cache is modified.
+        """
+        return SpectralTransform(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window_fn=self.window_fn,
+            onesided=self.onesided,
+            window=window,
+            periodic=self.periodic,
+            center=self.center,
+            center_pad_mode=self.center_pad_mode,
+            center_tail_pad=self.center_tail_pad,
+            normalized=self.normalized,
+            istft_backend_policy=self.istft_backend_policy,
+        )
+
     def _window_pair_for_dtype(self, dtype: Any) -> Tuple[mx.array, mx.array]:
         key = str(dtype)
         cached = self._window_runtime_cache.get(key)
         if cached is not None:
             return cached
 
-        window = self.window if self.window.dtype == dtype else self.window.astype(dtype)
+        window = self._window if self._window.dtype == dtype else self._window.astype(dtype)
         window_sq = (
-            self._window_sq if self._window_sq.dtype == dtype
-            else self._window_sq.astype(dtype)
+            self._window_sq_arr if self._window_sq_arr.dtype == dtype
+            else self._window_sq_arr.astype(dtype)
         )
         window = mx.contiguous(window)
         window_sq = mx.contiguous(window_sq)
@@ -8594,12 +8677,24 @@ def get_transform_mlx(
     center_tail_pad: CenterTailPad = "symmetric",
     istft_backend_policy: Optional[str] = None,
 ) -> SpectralTransform:
-    """Return a cached or bespoke SpectralTransform for the given config."""
+    """Return a cached or bespoke SpectralTransform for the given config.
+
+    When ``window`` is a concrete array (e.g. ``mx.array``), a new, unshared
+    (bespoke) ``SpectralTransform`` instance is returned rather than a cached instance.
+
+    Note:
+        When retrieving a shared transform (i.e. with ``window=None``), never
+        mutate ``transform.window`` in-place on the returned instance. Mutating
+        a shared transform alters an instance shared across callers. To use a
+        custom or checkpoint window, pass ``window=my_array`` directly to
+        :func:`get_transform_mlx` or call ``transform.with_window(my_array)`` to
+        create an independent transform instance.
+    """
     resolved_backend = _resolve_backend_policy(
         istft_backend_policy,
         default_policy=_DEFAULT_ISTFT_BACKEND_POLICY,
     )
-    if isinstance(window, mx.array):
+    if window is not None and not isinstance(window, str):
         return SpectralTransform(
             n_fft=n_fft,
             hop_length=hop_length,

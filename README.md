@@ -238,6 +238,10 @@ transform = SpectralTransform(
 )
 ```
 
+**Swapping custom and checkpoint windows:**
+- To derive an independent transform with a custom window without mutating shared cache, call `transform.with_window(new_window)` or pass `window=my_array` to `get_transform_mlx(...)`.
+- To replace the window on an owned instance, call `transform.set_window(new_window)` (or assign `transform.window = new_window`). This synchronizes `_window_runtime_cache` across all dtypes, updates NOLA safety signatures, and flushes compiled function caches.
+
 ### `MelSpectrogramTransform`
 
 Mel frontend powered by `SpectralTransform`.
@@ -511,8 +515,10 @@ get_transform_mlx(
 ) -> SpectralTransform
 ```
 
-If `window` is a concrete MLX array, a bespoke transform is returned instead of
-using the shared cache.
+If `window` is a concrete MLX array (e.g. from a checkpoint), a bespoke, unshared
+transform is returned instead of using the shared cache. Never mutate `.window` on
+instances retrieved without `window=`; use `transform.with_window(new_w)` to derive
+an independent transform, or `transform.set_window(new_w)` on an owned instance.
 
 ### `make_window(window, window_fn, win_length, n_fft, periodic)`
 

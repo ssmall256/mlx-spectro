@@ -11,6 +11,12 @@
   sliding-window separation models (Demucs, Conv-TasNet, BSRNN).
 - Support for `'constant'` (zero) padding in the fused Metal frame-extraction kernel,
   matching torch/librosa `pad_mode='constant'` semantics without intermediate pad buffers.
+- Added `with_window(new_window)` and `set_window(new_window)` to `SpectralTransform`
+  to safely swap analysis/synthesis windows without leaving stale runtime caches or
+  mutating shared instances.
+- Added property getter/setter for `window` and `_window_sq` on `SpectralTransform`
+  to automatically synchronize `_window_runtime_cache` and flush compiled function caches
+  when assigned directly.
 
 ### Changed
 
@@ -18,6 +24,8 @@
   and feature extraction pipelines, enabling deferred graph evaluation.
 - Optimized `librosa_cqt` (VQT / hybrid CQT) by reusing preallocated filter plans and
   avoiding redundant intermediate arrays.
+- Fused and fallback overlap-add operations use `mx.slice_update` along non-leading axes
+  for defense-in-depth against Metal slice-scatter indexing bugs in earlier runtimes.
 
 ## 0.9.7
 
