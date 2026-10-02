@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.9 - 2026-10-01
+
+### Changed
+
+- Updated minimum MLX dependency constraint to `>=0.32.3`.
+- Modernized `_place_rows` and Python `waveform_overlap_add` fallback to native
+  `array.at[...].add(...)`, leveraging MLX 0.32.0+'s corrected 2D Metal dispatch grid
+  linearization without row aliasing.
+
 ## 0.9.8
 
 ### Added
