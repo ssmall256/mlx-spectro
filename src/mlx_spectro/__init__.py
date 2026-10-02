@@ -1,6 +1,6 @@
 """mlx-spectro: High-performance STFT/iSTFT for Apple MLX."""
 
-__version__ = "0.9.9"
+__version__ = "0.9.10"
 
 from .librosa_cqt import VQTPlan, build_vqt_plan, vqt
 from .spectral_ops import (
