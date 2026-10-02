@@ -1866,12 +1866,7 @@ def waveform_overlap_add(
             end = off + this_len
             w_sub = w_f32[:this_len]
             chunk_val = f_flat[k, :, :this_len] * w_sub.reshape(1, -1)
-            out_acc = mx.slice_update(
-                out_acc,
-                out_acc[:, off:end] + chunk_val,
-                mx.array([off]),
-                axes=(1,),
-            )
+            out_acc = out_acc.at[:, off:end].add(chunk_val)
             if normalized:
                 w_acc = w_acc.at[off:end].add(w_sub)
         if normalized:
@@ -2671,23 +2666,13 @@ def _place_rows(
 ) -> mx.array:
     """Place ``values[:, :width]`` at column ``start`` of a zeroed ``(B, out_len)``.
 
-    Deliberately uses ``mx.slice_update`` rather than ``arr.at[:, a:b].add(...)``.
-    MLX before 0.32.0 mis-linearizes the 2-D dispatch grid in its Metal
-    ``slice_update_op_impl`` kernel (``gid.y`` is missing the ``gsize.x * NWORK``
-    factor), so a strided slice scatter-add aliases rows onto each other in a
-    non-atomic read-modify-write. That silently corrupted this adjoint for any
-    batch size greater than 1. ``mx.slice_update`` with an ``mx.array`` start
-    takes the DynamicSliceUpdate path and is exact on every supported version.
+    On MLX >= 0.32.0 (locked to 0.32.3), native ``arr.at[:, a:b].add(...)``
+    correctly linearizes 2-D Metal dispatch without row aliasing.
     """
     base = mx.zeros((B, out_len), dtype=values.dtype)
     if width <= 0:
         return base
-    return mx.slice_update(
-        base,
-        base[:, start:start + width] + values[:, :width],
-        mx.array([start]),
-        axes=(1,),
-    )
+    return base.at[:, start:start + width].add(values[:, :width])
 
 
 def _unpad_cotangent(
