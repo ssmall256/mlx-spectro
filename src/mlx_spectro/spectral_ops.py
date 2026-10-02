@@ -1,5 +1,7 @@
 """Reusable MLX spectral ops for STFT, mel, MFCC, and hybrid-CQT frontends."""
 
+from __future__ import annotations
+
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -104,6 +106,7 @@ __all__ = [
 import json
 import math
 import os
+import struct
 import sys
 import threading
 import time
@@ -111,7 +114,9 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-import numpy as np
+from ._lazy import LazyModule
+
+np: Any = LazyModule("numpy", globals(), "np")
 
 ISTFTBackendPolicy = Literal["auto", "mlx_fft", "metal", "torch_fallback"]
 STFTOutputLayout = Literal["bfn", "bnf"]
@@ -571,16 +576,17 @@ for (int k = first_k; k <= last_k; ++k) {
     int j = int(t) - offset;
     if (j >= 0 && j < int(chunk_len)) {
         float w = (float)window[j];
-        uint frame_idx = uint(k) * num_channels * chunk_len + ch * chunk_len + uint(j);
+        // 64-bit: frames can exceed 2^32 elements on long, many-channel inputs.
+        ulong frame_idx = (ulong(k) * num_channels + ch) * chunk_len + ulong(j);
         acc += (float)frames[frame_idx] * w;
         wsum += w;
     }
 }
 
 if (NORMALIZE) {
-    out[ch * total_samples + t] = (wsum > 1e-11f) ? (T)(acc / wsum) : (T)0.0f;
+    out[ulong(ch) * total_samples + t] = (wsum > 1e-11f) ? (T)(acc / wsum) : (T)0.0f;
 } else {
-    out[ch * total_samples + t] = (T)acc;
+    out[ulong(ch) * total_samples + t] = (T)acc;
 }
 """
 
@@ -2834,6 +2840,16 @@ class SpectralTransform:
         )
         self._window = mx.contiguous(new_window)
         self._window_sq_arr = mx.contiguous((self._window ** 2).astype(mx.float32))
+        if not isinstance(window, mx.array):
+            # A lazy array is bound to the stream of the thread that built it,
+            # and a transform (often shared through get_transform_mlx) may first
+            # run on another thread. Materialize windows built here; a caller's
+            # window keeps its lazy graph, and a trace is left alone.
+            try:
+                mx.eval(self._window, self._window_sq_arr)
+            except Exception as error:
+                if not _is_tracer_error(error):
+                    raise
         self._window_cache_sig = _window_cache_signature(
             provided_window=window,
             window_fn=self.window_fn,
@@ -5132,24 +5148,22 @@ def compute_mel_spectrogram_mlx(
     return spec, filterbank
 
 
-_LOG10_E = np.float32(1.0 / np.log(10.0))
+# float32(1 / ln 10), the value np.float32(1.0 / np.log(10.0)) gives, without NumPy.
+_LOG10_E = struct.unpack("f", struct.pack("f", 1.0 / math.log(10.0)))[0]
 
-_LOG_FN_DISPATCH: dict[str, object] = {
-    "log": np.log,
-    "log10": np.log10,
-}
+_LOG_FN_NAMES = ("log", "log10")
 
 
 def _resolve_log_fn_name(log_fn) -> str | None:
     if log_fn is None:
         return None
     if isinstance(log_fn, str):
-        if log_fn not in _LOG_FN_DISPATCH:
+        if log_fn not in _LOG_FN_NAMES:
             raise ValueError(f"Unsupported log_fn string: {log_fn!r} (expected 'log' or 'log10')")
         return log_fn
-    if log_fn is np.log or getattr(log_fn, "__name__", None) == "log":
+    if getattr(log_fn, "__name__", None) == "log":
         return "log"
-    if log_fn is np.log10 or getattr(log_fn, "__name__", None) == "log10":
+    if getattr(log_fn, "__name__", None) == "log10":
         return "log10"
     raise ValueError(
         f"Unsupported log_fn: {log_fn!r}. Pass 'log', 'log10', np.log, np.log10, or None."
@@ -5212,9 +5226,9 @@ def madmom_multires_mel_stack_mlx(
     fmax: float = DEFAULT_FMAX,
     norm_filters: bool = True,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log,
+    log_fn="log",
     mul: float | None = None,
-    add: float | None = np.spacing(1),
+    add: float | None = 2.0**-52,  # np.spacing(1)
     pad_frames: int = 0,
 ) -> mx.array:
     hop_size = int(round(hop_size_from_fps(fps, sample_rate)))
@@ -5254,7 +5268,7 @@ def madmom_single_resolution_log_stack_mlx(
     fps: float | None = None,
     hop_size: int | None = None,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log10,
+    log_fn="log10",
     mul: float | None = None,
     add: float | None = 1.0,
     pad_frames: int = 0,
@@ -5439,7 +5453,7 @@ def madmom_multires_log_diff_features(
     fmax: float = DEFAULT_FMAX,
     norm_filters: bool = True,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log10,
+    log_fn="log10",
     mul: float | None = 1.0,
     add: float | None = 1.0,
     diff_ratio: float = 0.5,
@@ -5501,7 +5515,7 @@ def madmom_multires_log_diff_features_mlx(
     fmax: float = DEFAULT_FMAX,
     norm_filters: bool = True,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log10,
+    log_fn="log10",
     mul: float | None = 1.0,
     add: float | None = 1.0,
     diff_ratio: float = 0.5,
@@ -5561,9 +5575,9 @@ def madmom_multires_mel_stack(
     fmax: float = DEFAULT_FMAX,
     norm_filters: bool = True,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log,
+    log_fn="log",
     mul: float | None = None,
-    add: float | None = np.spacing(1),
+    add: float | None = 2.0**-52,  # np.spacing(1)
     pad_frames: int = 0,
 ) -> np.ndarray:
     hop_size = int(round(hop_size_from_fps(fps, sample_rate)))
@@ -5598,7 +5612,7 @@ def madmom_single_resolution_log_stack(
     fps: float | None = None,
     hop_size: int | None = None,
     output_scale: FilteredOutputScale = "linear",
-    log_fn=np.log10,
+    log_fn="log10",
     mul: float | None = None,
     add: float | None = 1.0,
     pad_frames: int = 0,
@@ -5960,7 +5974,7 @@ def spectral_odf(
     fmin: float = DEFAULT_FMIN,
     fmax: float = DEFAULT_FMAX,
     norm_filters: bool = False,
-    log_fn=np.log10,
+    log_fn="log10",
     mul: float = 1.0,
     add: float = 1.0,
     diff_ratio: float = 0.5,
@@ -6882,7 +6896,7 @@ def logarithmic_spectrogram(
     *,
     mul: float = 1.0,
     add: float = 1.0,
-    log_fn=np.log10,
+    log_fn="log10",
 ) -> np.ndarray:
     out = np.asarray(spec, dtype=np.float32).copy()
     if mul is not None:
@@ -6890,6 +6904,8 @@ def logarithmic_spectrogram(
     if add is not None:
         out += np.float32(add)
     if log_fn is not None:
+        if isinstance(log_fn, str):
+            log_fn = np.log if _resolve_log_fn_name(log_fn) == "log" else np.log10
         out = log_fn(out).astype(np.float32)
     return out
 

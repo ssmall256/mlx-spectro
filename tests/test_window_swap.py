@@ -1,9 +1,8 @@
 """Tests for window swapping, runtime cache invalidation, and custom window handling in mlx-spectro."""
 import mlx.core as mx
 import numpy as np
-import pytest
 
-from mlx_spectro import SpectralTransform, get_transform_mlx, waveform_overlap_add
+from mlx_spectro import SpectralTransform, get_transform_mlx
 
 
 def test_set_window_updates_runtime_cache_and_signature():

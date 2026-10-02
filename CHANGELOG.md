@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A transform built on one thread failed on another with "There is no
+  Stream(gpu, N) in current thread": its window arrays were lazy graphs bound
+  to the building thread's stream, and `get_transform_mlx` shares instances.
+  Windows the library builds itself are now materialized at construction. A
+  window you pass in keeps its lazy graph, and construction inside a compile
+  trace still never evaluates.
+- `waveform_overlap_add`: the Metal kernel indexed frames with 32-bit integers,
+  which overflow past 2^32 frame elements (long, many-channel inputs). Indices
+  are now 64-bit.
+
+### Changed
+
+- NumPy is imported on first use instead of at `import mlx_spectro`. STFT,
+  iSTFT and compiled pairs never import it; the NumPy-based feature helpers
+  (filterbanks, CQT planning, onset functions) still work unchanged.
+- To keep that true at import, `log_fn` defaults are now the strings `"log"` /
+  `"log10"` (equivalent; `np.log` and other callables are still accepted) and
+  `add` defaults to `2.0**-52`, the exact value of `np.spacing(1)`.
+
 ## 0.9.9 - 2026-10-01
 
 ### Changed

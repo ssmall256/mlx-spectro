@@ -17,12 +17,14 @@ bins_per_octave=48, hop=320, gamma=0 (the MT-FiLM frontend).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
-import numpy as np
 
+from ._lazy import LazyModule
 from .spectral_ops import get_transform_mlx
+
+np: Any = LazyModule("numpy", globals(), "np")
 
 ResampleFn = Callable[[mx.array, int, int], mx.array]
 
